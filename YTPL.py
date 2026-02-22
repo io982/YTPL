@@ -94,9 +94,15 @@ def download_audio(url, temp_dir='temp_audio'):
     """
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+        'format': 'bestaudio/best',
         'outtmpl': temp_dir + '.%(ext)s',
-        'quiet': True,
+        'quiet': False,
+        'no_warnings': False,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['web', 'android', 'ios'],
+            }
+        },
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
