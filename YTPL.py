@@ -5,6 +5,15 @@ import subprocess
 import imageio_ffmpeg
 import requests
 from bs4 import BeautifulSoup
+import tempfile
+import logging
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 def parse_time(time_str):
     """
@@ -91,11 +100,16 @@ def extract_timestamps(text):
 def download_audio(url, temp_dir='temp_audio'):
     """
     Download audio from YouTube video using yt-dlp.
+    Returns path to downloaded MP3 file, title, description, duration.
     """
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    # Создаём временную директорию для загрузки
+    temp_dir_path = tempfile.mkdtemp(prefix='ytpl_audio_')
+    outtmpl = os.path.join(temp_dir_path, 'audio.%(ext)s')
+    
     ydl_opts = {
         'format': 'bestaudio/best',
-        'outtmpl': temp_dir + '.%(ext)s',
+        'outtmpl': outtmpl,
         'quiet': False,
         'no_warnings': False,
         'extractor_args': {
@@ -110,10 +124,21 @@ def download_audio(url, temp_dir='temp_audio'):
         description = info.get('description', '')
         duration = info['duration']
         ext = info.get('ext', 'm4a')
-        downloaded_file = temp_dir + '.' + ext
-        mp3_file = temp_dir + '.mp3'
+        
+        # Находим скачанный файл
+        downloaded_file = None
+        for f in os.listdir(temp_dir_path):
+            downloaded_file = os.path.join(temp_dir_path, f)
+            break
+        
+        if not downloaded_file or not os.path.exists(downloaded_file):
+            raise FileNotFoundError("Audio file was not downloaded successfully")
+        
+        mp3_file = os.path.join(temp_dir_path, 'audio.mp3')
         if ext.lower() == 'mp3':
-            mp3_file = downloaded_file  # already mp3
+            # Переименовываем в mp3 для единообразия
+            mp3_file = downloaded_file
+            os.rename(downloaded_file, mp3_file)
         else:
             # Convert to mp3 using ffmpeg
             cmd = [ffmpeg_path, '-i', downloaded_file, '-q:a', '0', '-y', mp3_file]
@@ -121,36 +146,79 @@ def download_audio(url, temp_dir='temp_audio'):
             # Remove original
             if os.path.exists(downloaded_file):
                 os.remove(downloaded_file)
-    return mp3_file, title, description, duration
+    
+    return mp3_file, title, description, duration, temp_dir_path
 
 def split_audio(audio_path, timestamps, duration, base_name='видео', output_dir='.'):
     """
     Split audio into segments based on timestamps using ffmpeg.
+    Returns list of created segment paths.
     """
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     segments = []
+    created_files = []
     start = 0
+    
+    # Фильтруем и валидируем временные метки
+    valid_timestamps = []
+    for ts in timestamps:
+        if ts <= start:
+            logger.warning(f"Пропущена некорректная метка: {ts}s (должна быть > {start}s)")
+            continue
+        if ts > duration:
+            logger.warning(f"Пропущена метка за пределами видео: {ts}s (длительность: {duration}s)")
+            continue
+        valid_timestamps.append(ts)
+    
+    timestamps = valid_timestamps
+    
     for i, end in enumerate(timestamps):
         if end > start:
             segments.append((start, end))
             start = end
+        else:
+            logger.warning(f"Пропущен перекрывающийся сегмент: {start}s - {end}s")
 
+    # Добавляем последний сегмент до конца видео
     if start < duration:
         segments.append((start, duration))
+    elif start == duration and segments:
+        logger.info("Последняя метка совпадает с концом видео, последний сегмент не нужен")
+    elif not segments:
+        logger.warning("Нет валидных сегментов для создания")
 
+    logger.info(f"Создание {len(segments)} сегментов")
+    
     for i, (start_time, end_time) in enumerate(segments):
-        print(f"Processing segment {i+1}: {start_time}s - {end_time}s")
         segment_num = f"{i+1:04d}"
         output_filename = os.path.join(output_dir, f"{base_name}_{segment_num}.mp3")
         duration_seg = end_time - start_time
+        
+        logger.info(f"Сегмент {i+1}/{len(segments)}: {start_time}s - {end_time}s ({duration_seg:.1f}s)")
+        
         cmd = [ffmpeg_path, '-i', audio_path, '-ss', str(start_time), '-t', str(duration_seg), '-c', 'copy', output_filename]
-        subprocess.run(cmd, check=True)
-        print(f"Saved: {output_filename}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            logger.error(f"Ошибка при создании сегмента {i+1}: {result.stderr}")
+            continue
+        
+        if os.path.exists(output_filename):
+            created_files.append(output_filename)
+            logger.info(f"Создан: {output_filename}")
+        else:
+            logger.error(f"Файл сегмента не был создан: {output_filename}")
+
+    return created_files
 
 def process_youtube_video(url, manual_timestamps=None):
     """
     Main function to process YouTube video.
+    Returns list of created segment paths.
     """
+    temp_dir_path = None  # Для хранения пути к временной директории
+    audio_path = None
+    
     try:
         print("Fetching video information...")
         # Get description using yt-dlp
@@ -176,32 +244,61 @@ def process_youtube_video(url, manual_timestamps=None):
         if not timestamps:
             cont = input("No timestamps found. Continue with download? (y/n): ").strip().lower()
             if cont != 'y':
-                return
+                return []
 
         # Download audio
-        temp_audio = 'temp_audio.mp3'
-        audio_path, _, _, _ = download_audio(url, temp_audio)
+        logger.info("Загрузка аудио...")
+        audio_path, _, _, _, temp_dir_path = download_audio(url)
 
         # Split audio
         base_name = re.sub(r'[^\w\-_\. ]', '_', title).replace(' ', '_')
         output_dir = base_name
         os.makedirs(output_dir, exist_ok=True)
-        split_audio(audio_path, timestamps, duration, base_name, output_dir)
+        
+        logger.info("Разделение аудио на сегменты...")
+        created_segments = split_audio(audio_path, timestamps, duration, base_name, output_dir)
 
-        # Clean up
-        if os.path.exists(temp_audio):
-            os.remove(temp_audio)
-        print("Processing completed successfully!")
+        print(f"\n{'='*50}")
+        print(f"Обработка завершена успешно!")
+        print(f"Создано сегментов: {len(created_segments)}")
+        print(f"Папка вывода: {output_dir}/")
+        print(f"{'='*50}")
+        
+        return created_segments
 
     except Exception as e:
-        print(f"Error: {e}")
-        if os.path.exists('temp_audio.mp3'):
-            os.remove('temp_audio.mp3')
+        logger.error(f"Ошибка: {e}")
+        raise
+    finally:
+        # Очистка временных файлов
+        if temp_dir_path and os.path.exists(temp_dir_path):
+            try:
+                import shutil
+                shutil.rmtree(temp_dir_path)
+                logger.info(f"Временные файлы удалены: {temp_dir_path}")
+            except Exception as cleanup_error:
+                logger.warning(f"Не удалось удалить временные файлы: {cleanup_error}")
 
 if __name__ == "__main__":
+    # Проверка наличия ffmpeg
+    try:
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        if not os.path.exists(ffmpeg_path):
+            raise RuntimeError(f"FFmpeg не найден по пути: {ffmpeg_path}")
+        logger.info(f"FFmpeg найден: {ffmpeg_path}")
+    except Exception as e:
+        logger.error(f"FFmpeg не найден. Установите imageio-ffmpeg: pip install imageio-ffmpeg")
+        exit(1)
+    
     url = input("Enter YouTube video URL: ").strip()
     manual_input = input("Enter manual timestamps (comma-separated in seconds, e.g., '145,325'), or leave empty to extract from description: ").strip()
 
     manual_timestamps = manual_input if manual_input else None
 
-    process_youtube_video(url, manual_timestamps)
+    try:
+        process_youtube_video(url, manual_timestamps)
+    except KeyboardInterrupt:
+        logger.info("\nОперация отменена пользователем")
+    except Exception as e:
+        logger.error(f"Произошла ошибка: {e}")
+        exit(1)

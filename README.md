@@ -10,6 +10,9 @@ A Python script to download YouTube videos and split their audio into segments b
 - Allows manual timestamp input
 - Splits audio into MP3 segments using ffmpeg
 - Sanitizes filenames for safe file system usage
+- **Improved error handling and logging**
+- **Automatic cleanup of temporary files**
+- **Validation of timestamps (skips invalid/overlapping ones)**
 
 ## Requirements
 
@@ -66,3 +69,15 @@ For example: `My_Video/My_Video_0001.mp3`, `My_Video/My_Video_0002.mp3`
 - Falls back to full page parsing if description lacks timestamps
 - Prompts for manual input if no timestamps found
 - Handles invalid URLs and missing dependencies gracefully
+- **Validates timestamps and skips invalid/overlapping ones**
+- **Automatic cleanup of temporary files on exit or error**
+- **FFmpeg availability check before processing**
+- **Detailed logging for troubleshooting**
+
+## Improvements in Latest Version
+
+- Temporary files now stored in isolated temp directories (no clutter in working directory)
+- Better error messages with timestamps via logging module
+- Validation of timestamps before processing
+- Graceful handling of keyboard interrupts (Ctrl+C)
+- Returns list of created segments for potential programmatic use
