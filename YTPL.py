@@ -53,7 +53,7 @@ def get_full_page_text(url):
         soup = BeautifulSoup(response.text, 'html.parser')
         return soup.get_text()
     except Exception as e:
-        print(f"Error fetching page text: {e}")
+        logger.warning(f"Error fetching page text: {e}")
         return ""
 
 def extract_timestamps(text):
@@ -74,7 +74,7 @@ def extract_timestamps(text):
             continue
 
     # Regex for video URL = time s patterns, e.g., https://youtu.be/...=1102s
-    pattern2 = r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+=([^&\s]+)'
+    pattern2 = r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^\s]*=(\d+s)'
     matches2 = re.findall(pattern2, text)
     for match in matches2:
         try:
@@ -97,13 +97,72 @@ def extract_timestamps(text):
 
     return sorted(set(timestamps))
 
-def download_audio(url, temp_dir='temp_audio'):
+def detect_silence_timestamps(audio_path, duration, noise_tol='-30dB', min_silence_dur=1.5):
     """
-    Download audio from YouTube video using yt-dlp.
-    Returns path to downloaded MP3 file, title, description, duration.
+    Detect silence gaps in audio using ffmpeg silencedetect and return split timestamps
+    at the midpoints of each silence region. Useful for splitting mix/album uploads
+    that have no chapter markers.
+    
+    Parameters:
+        audio_path     — path to audio file
+        duration       — total audio duration in seconds (silence beyond this is ignored)
+        noise_tol      — noise tolerance in dB (default: -30dB, range: -50 to -20)
+        min_silence_dur — minimum silence duration in seconds to treat as a track gap (default: 1.5)
+    
+    Returns:
+        Sorted list of timestamps (seconds) at silence-gap midpoints.
     """
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    # Создаём временную директорию для загрузки
+    logger.info(f"Запуск silencedetect (шум={noise_tol}, мин. пауза={min_silence_dur}s)...")
+
+    cmd = [
+        ffmpeg_path,
+        '-i', audio_path,
+        '-af', f'silencedetect=n={noise_tol}:d={min_silence_dur}',
+        '-f', 'null', '-'
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    silence_starts = []
+    silence_ends = []
+
+    for line in result.stderr.split('\n'):
+        if 'silence_start' in line:
+            m = re.search(r'silence_start:\s*([\d.]+)', line)
+            if m:
+                val = float(m.group(1))
+                silence_starts.append(val)
+        if 'silence_end' in line:
+            m = re.search(r'silence_end:\s*([\d.]+)', line)
+            if m:
+                val = float(m.group(1))
+                silence_ends.append(val)
+
+    # Pair starts and ends: ffmpeg outputs them in alternating order.
+    # Ignore silence that starts at 0.0 (leading silence).
+    timestamps = []
+    pairs = min(len(silence_starts), len(silence_ends))
+    for i in range(pairs):
+        s_start = silence_starts[i]
+        s_end = silence_ends[i]
+        # Skip leading silence
+        if s_start <= 0.1:
+            continue
+        midpoint = (s_start + s_end) / 2
+        if 0 < midpoint < duration - 1.0:  # not too close to the end
+            timestamps.append(midpoint)
+
+    logger.info(f"silencedetect: найдено тихих промежутков — {pairs}, "
+                f"валидных точек разреза — {len(timestamps)}")
+    return sorted(timestamps)
+
+
+def download_audio(url):
+    """
+    Download audio from YouTube video using yt-dlp.
+    Returns path to downloaded MP3 file, title, description, duration, temp_dir_path.
+    """
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     temp_dir_path = tempfile.mkdtemp(prefix='ytpl_audio_')
     outtmpl = os.path.join(temp_dir_path, 'audio.%(ext)s')
     
@@ -134,16 +193,12 @@ def download_audio(url, temp_dir='temp_audio'):
         if not downloaded_file or not os.path.exists(downloaded_file):
             raise FileNotFoundError("Audio file was not downloaded successfully")
         
-        mp3_file = os.path.join(temp_dir_path, 'audio.mp3')
         if ext.lower() == 'mp3':
-            # Переименовываем в mp3 для единообразия
-            mp3_file = downloaded_file
-            os.rename(downloaded_file, mp3_file)
+            mp3_file = downloaded_file  # Уже MP3, используем как есть
         else:
-            # Convert to mp3 using ffmpeg
+            mp3_file = os.path.join(temp_dir_path, 'audio.mp3')
             cmd = [ffmpeg_path, '-i', downloaded_file, '-q:a', '0', '-y', mp3_file]
             subprocess.run(cmd, check=True)
-            # Remove original
             if os.path.exists(downloaded_file):
                 os.remove(downloaded_file)
     
@@ -217,16 +272,11 @@ def process_youtube_video(url, manual_timestamps=None):
     Returns list of created segment paths.
     """
     temp_dir_path = None  # Для хранения пути к временной директории
-    audio_path = None
-    
+
     try:
-        print("Fetching video information...")
-        # Get description using yt-dlp
-        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            description = info.get('description', '')
-            title = info['title']
-            duration = info['duration']
+        # Download audio (получаем title, description, duration вместе с файлом)
+        logger.info("Загрузка аудио...")
+        audio_path, title, description, duration, temp_dir_path = download_audio(url)
         print(f"Video title: {title}")
         print(f"Video duration: {duration}s")
 
@@ -242,13 +292,13 @@ def process_youtube_video(url, manual_timestamps=None):
             print(f"Extracted timestamps: {timestamps}")
 
         if not timestamps:
+            logger.info("Метки времени не найдены. Запускаю анализ пауз (silence detection)...")
+            timestamps = detect_silence_timestamps(audio_path, duration)
+
+        if not timestamps:
             cont = input("No timestamps found. Continue with download? (y/n): ").strip().lower()
             if cont != 'y':
                 return []
-
-        # Download audio
-        logger.info("Загрузка аудио...")
-        audio_path, _, _, _, temp_dir_path = download_audio(url)
 
         # Split audio
         base_name = re.sub(r'[^\w\-_\. ]', '_', title).replace(' ', '_')
@@ -289,7 +339,7 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"FFmpeg не найден. Установите imageio-ffmpeg: pip install imageio-ffmpeg")
         exit(1)
-    
+
     url = input("Enter YouTube video URL: ").strip()
     manual_input = input("Enter manual timestamps (comma-separated in seconds, e.g., '145,325'), or leave empty to extract from description: ").strip()
 

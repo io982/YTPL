@@ -12,6 +12,7 @@ A Python script to download YouTube videos and split their audio into segments b
 - Sanitizes filenames for safe file system usage
 - **Improved error handling and logging**
 - **Automatic cleanup of temporary files**
+- **Silence detection: when no timestamps found, automatically splits audio by silence gaps between tracks**
 - **Validation of timestamps (skips invalid/overlapping ones)**
 
 ## Requirements
@@ -46,8 +47,9 @@ Optionally enter manual timestamps as comma-separated seconds (e.g., '145,325'),
 The script will:
 - Fetch video information
 - Extract timestamps from description and page
+- **If no timestamps found, run silence detection to find gaps between tracks**
 - Download and convert audio to MP3
-- Split into segments based on timestamps
+- Split into segments based on timestamps (or detected silence gaps)
 - Save MP3 files with sanitized names
 
 ## Output
@@ -63,10 +65,12 @@ For example: `My_Video/My_Video_0001.mp3`, `My_Video/My_Video_0002.mp3`
 - URL parameters: `&t=145s`, `?t=2m25s`
 - Time codes in text: `1:30`, `1:30:25`
 - Custom URL formats: `https://youtu.be/...=1102s`
+- **Silence detection fallback: when no timestamps found, ffmpeg `silencedetect` filter scans audio amplitude to find gaps between tracks (configurable via `noise_tol` and `min_silence_dur`)**
 
 ## Error Handling
 
 - Falls back to full page parsing if description lacks timestamps
+- **Falls back to silence detection if no timestamps found anywhere**
 - Prompts for manual input if no timestamps found
 - Handles invalid URLs and missing dependencies gracefully
 - **Validates timestamps and skips invalid/overlapping ones**
@@ -76,6 +80,7 @@ For example: `My_Video/My_Video_0001.mp3`, `My_Video/My_Video_0002.mp3`
 
 ## Improvements in Latest Version
 
+- **Silence detection with ffmpeg `silencedetect` filter — automatically splits mix/album uploads without chapter markers**
 - Temporary files now stored in isolated temp directories (no clutter in working directory)
 - Better error messages with timestamps via logging module
 - Validation of timestamps before processing
