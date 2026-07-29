@@ -171,11 +171,10 @@ def download_audio(url):
         'outtmpl': outtmpl,
         'quiet': False,
         'no_warnings': False,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['web', 'android', 'ios'],
-            }
-        },
+        'socket_timeout': 60,       # увеличенный таймаут сокета (было 20 по умолчанию)
+        'retries': 10,              # количество повторных попыток при ошибке загрузки
+        'fragment_retries': 10,     # повторные попытки для фрагментированных потоков
+        'http_chunk_size': 10485760, # 10 МБ чанки — помогают при нестабильном соединении
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -351,4 +350,9 @@ if __name__ == "__main__":
         logger.info("\nОперация отменена пользователем")
     except Exception as e:
         logger.error(f"Произошла ошибка: {e}")
-        exit(1)
+        print(f"\n[ОШИБКА] {e}")
+        print("Возможные решения:")
+        print("  1. Проверьте подключение к интернету")
+        print("  2. Обновите yt-dlp: pip install -U yt-dlp")
+        print("  3. Обновите imageio-ffmpeg: pip install -U imageio-ffmpeg")
+        print("  4. Попробуйте другую ссылку на YouTube")

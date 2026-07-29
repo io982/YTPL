@@ -17,9 +17,15 @@ if %errorlevel% neq 0 (
 
 :: Run the script
 python "%~dp0YTPL.py"
+set EXITCODE=%errorlevel%
 
 echo.
 echo ==========================================
-echo Done! Press any key to exit.
+if %EXITCODE% equ 0 (
+    echo Done! Press any key to exit.
+) else (
+    echo Script finished with errors ^(code %EXITCODE%^).
+    echo Press any key to exit.
+)
 echo ==========================================
 pause
