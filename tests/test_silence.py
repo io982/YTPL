@@ -148,3 +148,55 @@ def test_min_silence_below_floor_still_works(album_audio):
     cuts = YTPL.detect_silence_timestamps(path, duration, min_silence_dur=0.5, floor=0.8)
 
     assert len(cuts) == 2
+
+
+def test_default_max_segment_leaves_a_long_song_alone(gapless_audio):
+    """
+    A 5:28 song with no internal pause was being cut in half simply for being
+    longer than the old five-minute limit. Nothing says to cut there, so
+    nothing should.
+    """
+    path, duration = gapless_audio          # 700 s, no pauses at all
+
+    assert YTPL.DEFAULT_MAX_SEGMENT == 900.0
+    assert YTPL.detect_silence_timestamps(path, duration) == []
+
+
+def test_max_segment_zero_never_cuts_where_there_is_no_pause(gapless_audio):
+    path, duration = gapless_audio
+
+    assert YTPL.detect_silence_timestamps(path, duration, max_segment_len=0) == []
+
+
+def test_max_segment_zero_still_cuts_at_real_pauses(album_audio):
+    """
+    Turning the length rule off must not turn the silence detection off.
+    """
+    path, duration = album_audio
+
+    cuts = YTPL.detect_silence_timestamps(path, duration, max_segment_len=0)
+
+    assert len(cuts) == 2
+
+
+def test_default_noise_threshold_ignores_quiet_music():
+    """
+    A soft musical passage is not a gap between tracks. One 9-minute track had
+    seven "pauses" at -30dB and none at -40dB, and was being cut into three.
+    """
+    assert YTPL.DEFAULT_NOISE == '-40dB'
+
+
+def test_quiet_passages_are_not_treated_as_gaps(make_audio):
+    """
+    Tone, then a soft passage, then tone again: music that happens to be
+    quiet, not a gap. The old -30dB threshold called it silence.
+    """
+    path, duration = make_audio([
+        ('tone', 30, 440),
+        ('quiet', 3),
+        ('tone', 30, 660),
+    ], 'quiet_passage')
+
+    assert YTPL.detect_silence_timestamps(path, duration, noise_tol='-30dB')
+    assert YTPL.detect_silence_timestamps(path, duration) == []

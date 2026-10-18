@@ -42,7 +42,7 @@ explicitly with `--from-description`.
 - **Splits by silence gaps between tracks by default (`silencedetect`)**
 - Recursive threshold lowering: starts at 1.5 s pauses and goes down to 0.8 s
   while any piece is still longer than `--max-segment`; whatever stays too long
-  is split evenly by that length
+  is split evenly by that length (`--max-segment 0` turns that last resort off)
 - Short tracks are merged into their neighbour (`--min-segment`), so no stray
   fragments
 - **Chapters and description timestamps on demand (`--from-description`)**:
@@ -115,10 +115,10 @@ Passing a URL as an argument runs the default mode without any questions.
 | `--no-log-file` | do not write a log file |
 | `-v`, `--verbose` | debug output on the console, and yt-dlp's own |
 | `--remote-components ejs:github` | let yt-dlp fetch the JS challenge solver at run time |
-| `--noise 30dB` | silence volume threshold (default `-30dB`; the minus sign may be omitted, or use `--noise=-30dB`) |
+| `--noise 40dB` | how quiet counts as silence (default `-40dB`; the minus sign may be omitted, or use `--noise=-40dB`) |
 | `--min-silence 1.5` | starting pause-length threshold, seconds |
 | `--floor 0.8` | lowest pause-length threshold, seconds |
-| `--max-segment 300` | a piece longer than this gets re-split with a lower threshold |
+| `--max-segment 900` | a piece longer than this is re-read at a lower threshold and, failing that, cut where no pause was; 0 means only ever cut at a real pause |
 | `--min-segment 15` | minimum track length; shorter pieces are merged into the neighbour |
 
 Examples:
@@ -206,12 +206,16 @@ detail goes to the log file:
 ```
 Playlist: Essential NewRetroWave Vocal Jams
 426 tracks -> Essential_NewRetroWave_Vocal_Jams/
+About 3.3 GB needed, 113.7 GB free
 Keys: [p] pause   [s] stop after this track   [Ctrl+C] stop now
 
-[1/426] Sun City - Restless Heart -> 1 file
-[2/426] Thought Beings - Sky High -> 2 files
-[3/426] 423 left | Subject Sue - Details in the Dark
+[3/426] 423 left | downloading: Subject Sue - Details in the Dark
 ```
+
+That last line is written over, not added to, so several hundred tracks do not
+leave several hundred lines behind; it reads `done: <track> -> 2 files` as each
+one lands. Only what is worth keeping gets a line of its own: a failure, a
+pause, a stop, and the summary. The full list is in the log.
 
 | Key | Effect |
 | --- | --- |
@@ -219,21 +223,43 @@ Keys: [p] pause   [s] stop after this track   [Ctrl+C] stop now
 | `s` or `q` | stop after the current track |
 | `Ctrl+C` | stop now; the track in progress is rolled back |
 
-Keys pressed during a download take effect when that track finishes, which is
-the point: stopping half way through would leave a part-written track behind.
+A key pressed during a download is acknowledged on the spot - `[s] stop
+requested - finishing this track first` - and acted on when that track
+finishes, which is the point: stopping half way through would leave a
+part-written track behind.
+
+If the console window is closed, the run stops at the next track rather than
+carrying on without it: a closed window takes the ffmpeg and node subprocesses
+with it, and a run that does not notice spends the rest of the playlist
+failing at everything.
 A file named `STOP` next to the program does the same as `s`, for when the
 console cannot be reached. Either way the summary says where it stopped, and
 running the same command again carries on from there.
 
 ### One file per track
 
-A track with a long enough pause inside it is split, which is usually what you
-want for a mix but not always for a song. To keep every track whole, set a
-minimum segment longer than any track:
+A track is only ever cut where the audio really does go quiet. Two defaults
+decide what "quiet" means, and both were set from tracks that were being cut
+when they should not have been:
+
+- `--noise -40dB`. At the old `-30dB` a soft musical passage counted as a gap:
+  one 9-minute track had seven of them at `-30dB` and none at all at `-40dB`,
+  and was coming out as three files.
+- `--max-segment 900`. A piece longer than this is cut where no pause was
+  found, which is for a mix recorded as one unbroken stretch. At the old five
+  minutes a 5:28 song with no internal pause whatsoever was cut in half for
+  nothing.
+
+If a track still comes out in pieces, `--min-segment` longer than any track
+keeps it whole, and `--max-segment 0` stops anything being cut where no pause
+was found:
 
 ```bash
 python YTPL.py "<url>" --playlist --min-segment 600
 ```
+
+A mix whose gaps are noisy rather than silent needs the opposite: `--noise 30dB`
+makes the detection less fussy again.
 
 ## Logging
 
@@ -384,6 +410,17 @@ an external source while the program works, so it is off by default.
 - **Fixed: a title the console cannot encode would have ended the whole run**
   from outside the per-track error handling
 - **A pause is now unmissable** on the console and recorded in the log
+- **Key presses are acknowledged as they happen**, during a download rather
+  than silently at the end of one
+- **The console no longer grows a line per track**; the progress line is
+  written over
+- **Fixed: a 5:28 song with no pause in it was cut in half** merely for being
+  longer than the old five-minute `--max-segment`; the default is 15 minutes
+  now and `0` turns that last resort off
+- **Fixed: quiet music counted as a gap.** `--noise` defaults to `-40dB`
+  instead of `-30dB`, which stops soft passages splitting a track
+- **Fixed: closing the console window ended the run with a traceback** out of
+  a print; the run now stops cleanly and says why
 
 - **Silence analysis is now the default; chapters and description are used only
   with `--from-description`**

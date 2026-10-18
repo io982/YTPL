@@ -78,6 +78,19 @@ DEFAULT_MIN_FREE_MB = 500
 # Every download works in its own folder under the system temp directory.
 TEMP_PREFIX = 'ytpl_audio_'
 
+# How quiet a passage has to be to count as a gap between tracks. At -30dB a
+# soft musical passage qualifies: one 9-minute track had seven "pauses" at
+# -30dB and none at all at -40dB, and was being cut into three. A real gap
+# between tracks is far quieter than the quietest music.
+DEFAULT_NOISE = '-40dB'
+
+# A piece longer than this is re-read at a lower pause threshold and, if that
+# finds nothing either, cut where no pause was. That last resort is for a mix
+# recorded as one unbroken stretch; a song is not that, and at the old 5 minutes
+# a 5:28 track with no internal pause at all was being cut in half for nothing.
+# 15 minutes is longer than songs get and still breaks up a long mix.
+DEFAULT_MAX_SEGMENT = 900.0
+
 # A file by this name asks a playlist run to stop at the next track boundary.
 STOP_FILE = 'STOP'
 
@@ -97,6 +110,9 @@ TRACK_RETRY_WAIT = 3
 
 # The 403 hint is worth saying once a run, not once a track.
 _403_hint_shown = False
+
+# A key press waiting to be acted on at the next track boundary.
+_pending_control = None
 
 # Cached result of node_is_usable(), so the probe runs once per process.
 _node_checked = None
@@ -460,6 +476,10 @@ def _download_progress(status):
     One line per finished download instead of yt-dlp's live progress bar, which
     would be thousands of lines in the log file on a long playlist.
     """
+    # Keys are read here too, so a press during a long download is answered
+    # straight away instead of in silence until the track ends.
+    poll_keys()
+
     state = status.get('status')
     if state == 'finished':
         size = status.get('total_bytes') or status.get('downloaded_bytes') or 0
@@ -596,9 +616,9 @@ def _enforce_min_segment(cuts, total, min_seg):
     return kept[1:]  # internal cut points only
 
 
-def detect_silence_timestamps(audio_path, duration, noise_tol='-30dB',
+def detect_silence_timestamps(audio_path, duration, noise_tol=DEFAULT_NOISE,
                               min_silence_dur=1.5, floor=0.8, step=0.35,
-                              max_segment_len=300.0, min_segment=15.0):
+                              max_segment_len=DEFAULT_MAX_SEGMENT, min_segment=15.0):
     """
     Recursive splitting by pauses. Starts at the min_silence_dur threshold
     (1.5 s) and keeps lowering it down to floor (0.8 s) while any piece is
@@ -611,11 +631,14 @@ def detect_silence_timestamps(audio_path, duration, noise_tol='-30dB',
     at every level.
 
     Parameters:
-        noise_tol       - silence volume threshold (default -30dB).
+        noise_tol       - how quiet counts as silence (default -40dB).
         min_silence_dur - starting pause-length threshold (default 1.5 s).
         floor           - lowest pause-length threshold (default 0.8 s).
         step            - threshold lowering step (default 0.35 s).
-        max_segment_len - a piece longer than this counts as too long (5 min).
+        max_segment_len - a piece longer than this counts as too long, and is
+                          re-read at a lower threshold and, failing that, cut
+                          where nothing says to. 0 turns that off: only real
+                          pauses are ever cut at.
         min_segment     - minimum track length (default 15 s).
 
     Returns:
@@ -651,11 +674,13 @@ def detect_silence_timestamps(audio_path, duration, noise_tol='-30dB',
     cuts = list(base)
 
     # Threshold lowering and hard splitting apply only to the pieces that are
-    # still too long after the first pass.
-    bounds = [0.0] + base + [float(duration)]
-    for i in range(len(bounds) - 1):
-        cuts += _segment_recursive(candidates, bounds[i], bounds[i + 1], 1, levels,
-                                   max_segment_len, hard_split_len=max_segment_len)
+    # still too long after the first pass. With max_segment_len at 0 there is
+    # no such thing as too long, and nothing is cut where no pause was found.
+    if max_segment_len:
+        bounds = [0.0] + base + [float(duration)]
+        for i in range(len(bounds) - 1):
+            cuts += _segment_recursive(candidates, bounds[i], bounds[i + 1], 1, levels,
+                                       max_segment_len, hard_split_len=max_segment_len)
 
     cuts = sorted({c for c in cuts if 0 < c < duration})
     cuts = _enforce_min_segment(cuts, duration, min_segment)
@@ -1153,6 +1178,31 @@ def stop_requested(directory='.'):
     return os.path.exists(os.path.join(directory, STOP_FILE))
 
 
+def poll_keys():
+    """
+    Pick up a key press and acknowledge it at once.
+
+    Called from the download progress hook as well as between tracks: a key
+    pressed while a track is downloading would otherwise sit unread until that
+    track finished, with nothing on screen to show it had been noticed.
+
+    Returns 'stop', 'pause' or None - whatever is waiting to be acted on.
+    """
+    global _pending_control
+    key = _read_key()
+
+    if key in ('s', 'q') and _pending_control != 'stop':
+        _pending_control = 'stop'
+        logger.info(f"Stop requested with [{key}]")
+        _line("[s] stop requested - finishing this track first")
+    elif key == 'p' and _pending_control is None:
+        _pending_control = 'pause'
+        logger.info("Pause requested with [p]")
+        _line("[p] pause requested - finishing this track first")
+
+    return _pending_control
+
+
 def check_controls(directory='.'):
     """
     Look for a pause or stop request between tracks. Returns 'stop' to end the
@@ -1162,33 +1212,64 @@ def check_controls(directory='.'):
     effect as soon as the track in progress is finished - which is the point:
     stopping half way through a track would leave a part-written one behind.
     """
-    key = _read_key()
+    global _pending_control
+    pending = poll_keys()
+    _pending_control = None
 
-    if key in ('s', 'q') or stop_requested(directory):
-        logger.info("Stop requested" + (f" with [{key}]" if key else
-                                        f" by the {STOP_FILE} file"))
+    if _console_lost:
         return 'stop'
 
-    if key == 'p':
+    if pending == 'stop' or stop_requested(directory):
+        if pending != 'stop':
+            logger.info(f"Stop requested by the {STOP_FILE} file")
+        _line("stopping")
+        return 'stop'
+
+    if pending == 'pause':
         # Logged, not just printed: a run sitting still is the first thing to
         # explain afterwards, and the console scrollback is not evidence.
         logger.info("Paused by the user")
         _line("")
-        print("*" * 52)
-        print("***  PAUSED  ***   [p] carry on   [s] stop")
-        print("*" * 52)
+        _print("*" * 52)
+        _print("***  PAUSED  ***   [p] carry on   [s] stop")
+        _print("*" * 52)
         while True:
             key = _read_key()
             if key == 'p':
                 logger.info("Resumed by the user")
-                _line("carrying on")
+                _print("carrying on")
                 return None
-            if key in ('s', 'q') or stop_requested(directory):
+            if key in ('s', 'q') or stop_requested(directory) or _console_lost:
                 logger.info("Stop requested while paused")
+                _print("stopping")
                 return 'stop'
             time.sleep(0.2)
 
     return None
+
+
+# Set when writing to the console fails. A closed window takes the child
+# processes with it while python carries on, which is how a run once spent
+# four hundred tracks failing at everything.
+_console_lost = False
+
+
+def _write(text, end=chr(10)):
+    """
+    Write to the console, once. If the console has gone - the window was
+    closed, the pipe at the other end is dead - say so in the log and stop
+    writing, rather than let an OSError out of a print and end the run with a
+    traceback.
+    """
+    global _console_lost
+    if _console_lost:
+        return
+    try:
+        print(text, end=end, flush=True)
+    except (OSError, ValueError) as e:
+        _console_lost = True
+        logger.warning(f"The console cannot be written to any more ({e}); "
+                       "the run will stop after this track")
 
 
 def _console_safe(text):
@@ -1209,9 +1290,10 @@ def _console_safe(text):
 
 def _print(text=''):
     """
-    print() that cannot fall over an unencodable character.
+    print() that can neither fall over an unencodable character nor over a
+    console that is no longer there.
     """
-    print(_console_safe(text))
+    _write(_console_safe(text))
 
 
 def _console_width():
@@ -1227,7 +1309,7 @@ def _status(text):
     per update.
     """
     width = max(_console_width() - 1, 20)
-    print('\r' + _console_safe(text)[:width].ljust(width), end='', flush=True)
+    _write('\r' + _console_safe(text)[:width].ljust(width), end='')
 
 
 def _line(text):
@@ -1235,7 +1317,7 @@ def _line(text):
     Finish the status line and leave text in its place.
     """
     width = max(_console_width() - 1, 20)
-    print('\r' + _console_safe(text)[:width].ljust(width))
+    _write('\r' + _console_safe(text)[:width].ljust(width))
 
 
 def process_playlist(playlist_title, entries, unavailable=0, manual_timestamps=None,
@@ -1329,10 +1411,11 @@ def process_playlist(playlist_title, entries, unavailable=0, manual_timestamps=N
         # else fills the disk meanwhile, and a disk with nothing left on it is
         # a far worse way to find out.
         if min_free_mb:
-            left = free_space(root)
-            if left is not None and left < min_free_mb * 1024 * 1024:
+            # Not 'left': that is how many tracks are still to come.
+            space = free_space(root)
+            if space is not None and space < min_free_mb * 1024 * 1024:
                 stopped_at = i
-                stop_reason = f"only {format_size(left)} left on disk"
+                stop_reason = f"only {format_size(space)} left on disk"
                 logger.error(f"Stopping before track {i}: {stop_reason}")
                 _line(f"[{i}/{total}] stopping - {stop_reason}")
                 break
@@ -1347,7 +1430,8 @@ def process_playlist(playlist_title, entries, unavailable=0, manual_timestamps=N
 
         for attempt in range(1, max(attempts, 1) + 1):
             suffix = f" (attempt {attempt}/{attempts})" if attempt > 1 else ""
-            _status(f"[{i}/{total}] {left} left | {entry['title']}{suffix}")
+            _status(f"[{i}/{total}] {left} left | downloading: "
+                    f"{entry['title']}{suffix}")
             try:
                 files = process_youtube_video(entry['url'], manual_timestamps, mode,
                                               silence_opts, output_dir=root,
@@ -1374,8 +1458,10 @@ def process_playlist(playlist_title, entries, unavailable=0, manual_timestamps=N
             created += files
             in_a_row = 0
             last_error = None
-            _line(f"[{i}/{total}] {entry['title']} -> "
-                  f"{len(files)} file{'s' if len(files) != 1 else ''}")
+            # Written over, not added to: several hundred tracks should not
+            # leave several hundred lines behind. The full list is in the log.
+            _status(f"[{i}/{total}] {left} left | done: {entry['title']} -> "
+                    f"{len(files)} file{'s' if len(files) != 1 else ''}")
             break
 
         if stopped_at:
@@ -1584,15 +1670,18 @@ def build_parser():
                         "local alternative. Repeat the flag for several components")
 
     g = p.add_argument_group('silence analysis settings')
-    g.add_argument('--noise', default='-30dB', metavar='dB',
+    g.add_argument('--noise', default=DEFAULT_NOISE, metavar='dB',
                    help='volume threshold below which sound counts as silence; '
                         'the minus sign may be omitted: --noise 30dB or --noise=-30dB')
     g.add_argument('--min-silence', type=float, default=1.5, metavar='SEC',
                    help='starting pause-length threshold')
     g.add_argument('--floor', type=float, default=0.8, metavar='SEC',
                    help='lowest pause-length threshold when lowering')
-    g.add_argument('--max-segment', type=float, default=300.0, metavar='SEC',
-                   help='a piece longer than this is re-split with a lower threshold')
+    g.add_argument('--max-segment', type=float, default=DEFAULT_MAX_SEGMENT,
+                   metavar='SEC',
+                   help='a piece longer than this is re-read at a lower pause '
+                        'threshold and, failing that, cut where no pause was; '
+                        '0 means only ever cut at a real pause')
     g.add_argument('--min-segment', type=float, default=15.0, metavar='SEC',
                    help='minimum track length: short stubs are merged into the neighbour')
     return p
@@ -1654,7 +1743,7 @@ def normalize_noise(value):
     """
     value = str(value).strip()
     if not value:
-        return '-30dB'
+        return DEFAULT_NOISE
     if not value.startswith('-'):
         value = '-' + value.lstrip('+')
     return value

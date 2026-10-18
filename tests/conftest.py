@@ -50,6 +50,7 @@ def make_audio(ffmpeg, tmp_path_factory):
     """
     Test-audio factory. Takes a list of pieces:
         ('tone', duration, frequency) - an audible piece,
+        ('quiet', duration)           - audible but soft, -33 dB measured,
         ('silence', duration)         - silence.
 
     Returns (path to the wav, total duration in seconds).
@@ -72,6 +73,15 @@ def make_audio(ffmpeg, tmp_path_factory):
             if part[0] == 'tone':
                 _, dur, freq = part
                 src = f'sine=frequency={freq}:duration={dur}:sample_rate=8000'
+            elif part[0] == 'quiet':
+                # Audible but soft: music, not a gap between tracks. lavfi's
+                # sine comes out at -18 dB, so -15 dB of gain reduction puts
+                # this at -33 dB measured - below a -30 dB silence threshold
+                # and above a -40 dB one, which is the difference these tests
+                # are about.
+                _, dur = part
+                src = (f'sine=frequency=440:duration={dur}:sample_rate=8000,'
+                       'volume=-15dB')
             else:
                 _, dur = part
                 src = 'anullsrc=r=8000:cl=mono'

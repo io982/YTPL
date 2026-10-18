@@ -8,6 +8,7 @@ of the stub matches what yt-dlp really returns for a flat extraction, including
 the empty stubs that deleted and private videos come back as.
 """
 import os
+import re
 import types
 
 import pytest
@@ -859,3 +860,146 @@ def test_renumbering_does_not_overwrite(tmp_path):
     YTPL.renumber_existing_tracks(str(root), _entries(1))
 
     assert sorted(os.listdir(root)) == ['001-Track_0.mp3', 'Track_0.mp3']
+
+
+# --- a console that is no longer there ------------------------------------
+
+@pytest.fixture(autouse=True)
+def _reset_console_state():
+    """
+    Both flags are module state; a test that sets one must not leak it.
+    """
+    YTPL._console_lost = False
+    YTPL._pending_control = None
+    yield
+    YTPL._console_lost = False
+    YTPL._pending_control = None
+
+
+def test_a_dead_console_does_not_raise(monkeypatch, caplog):
+    """
+    Closing the window made print raise OSError 233 and ended the run with a
+    traceback, from outside any error handling.
+    """
+    def _dead(*a, **k):
+        raise OSError(233, 'no process is on the other end of the pipe')
+
+    monkeypatch.setattr('builtins.print', _dead)
+
+    YTPL._write('anything')                 # must not raise
+
+    assert YTPL._console_lost is True
+    assert 'console cannot be written to' in caplog.text
+
+
+def test_nothing_more_is_written_to_a_dead_console(monkeypatch):
+    calls = []
+
+    def _dead(*a, **k):
+        calls.append(a)
+        raise OSError(233, 'gone')
+
+    monkeypatch.setattr('builtins.print', _dead)
+    YTPL._write('first')
+    YTPL._write('second')
+
+    assert len(calls) == 1                  # it gave up after the first
+
+
+def test_a_dead_console_stops_the_run(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(YTPL, '_read_key', lambda: None)
+    YTPL._console_lost = True
+
+    assert YTPL.check_controls() == 'stop'
+
+
+# --- acknowledging a key press --------------------------------------------
+
+def test_a_key_during_a_download_is_acknowledged(monkeypatch, capsys):
+    """
+    Pressing [s] used to print nothing until the track finished, so there was
+    no sign it had been noticed.
+    """
+    monkeypatch.setattr(YTPL, '_read_key', lambda: 's')
+
+    assert YTPL.poll_keys() == 'stop'
+
+    assert 'stop requested' in capsys.readouterr().out
+
+
+def test_a_pause_key_during_a_download_is_acknowledged(monkeypatch, capsys):
+    monkeypatch.setattr(YTPL, '_read_key', lambda: 'p')
+
+    assert YTPL.poll_keys() == 'pause'
+    assert 'pause requested' in capsys.readouterr().out
+
+
+def test_a_key_is_only_acknowledged_once(monkeypatch, capsys):
+    monkeypatch.setattr(YTPL, '_read_key', lambda: 's')
+    YTPL.poll_keys()
+    capsys.readouterr()
+
+    YTPL.poll_keys()
+
+    assert capsys.readouterr().out == ''
+
+
+def test_the_download_hook_reads_keys(monkeypatch, capsys):
+    """
+    The hook is what runs while a track downloads, so that is where a press
+    has to be picked up.
+    """
+    monkeypatch.setattr(YTPL, '_read_key', lambda: 's')
+
+    YTPL._download_progress({'status': 'downloading', 'downloaded_bytes': 1})
+
+    assert YTPL._pending_control == 'stop'
+
+
+def test_a_key_pressed_during_a_download_stops_the_run(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(YTPL, '_read_key', lambda: 's')
+    YTPL.poll_keys()                        # pressed while downloading
+    monkeypatch.setattr(YTPL, '_read_key', lambda: None)
+
+    assert YTPL.check_controls() == 'stop'
+    assert 'stopping' in capsys.readouterr().out
+
+
+def test_the_stop_file_also_says_so(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(YTPL, '_read_key', lambda: None)
+    open(tmp_path / YTPL.STOP_FILE, 'wb').close()
+
+    assert YTPL.check_controls() == 'stop'
+    assert 'stopping' in capsys.readouterr().out
+
+
+# --- the console does not grow --------------------------------------------
+
+def test_finished_tracks_do_not_each_leave_a_line(track_runner, capsys):
+    """
+    Several hundred tracks must not leave several hundred lines: the progress
+    line is written over, and only what needs keeping is printed.
+    """
+    YTPL.process_playlist('My Mix', _entries(5))
+    out = capsys.readouterr().out
+
+    body = out.split('=' * 50)[0]           # everything before the summary
+    assert body.count(chr(10)) <= 6         # header and keys only
+    assert body.count(chr(13)) >= 5         # one rewrite per track
+    assert 'done: Track 4 -> 1 file' in out
+
+
+def test_the_status_line_counts_tracks_not_bytes(track_runner, capsys):
+    """
+    The disk check once reused the name that held the number of tracks still
+    to come, so the line read '68661698560 left' - the free space in bytes.
+    """
+    YTPL.process_playlist('My Mix', _entries(3), min_free_mb=1)
+    out = capsys.readouterr().out
+
+    assert '2 left' in out
+    assert '0 left' in out
+    assert not re.search(r'\d{6,} left', out)

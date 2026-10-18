@@ -65,10 +65,10 @@ def test_parser_defaults():
     assert args.from_description is False
     assert args.force_silence is False
     assert args.timestamps is None
-    assert args.noise == '-30dB'
+    assert args.noise == YTPL.DEFAULT_NOISE
     assert args.min_silence == 1.5
     assert args.floor == 0.8
-    assert args.max_segment == 300.0
+    assert args.max_segment == YTPL.DEFAULT_MAX_SEGMENT
     assert args.min_segment == 15.0
 
 
@@ -96,7 +96,7 @@ def test_silence_opts_from_args():
     ('30dB', '-30dB'),      # argparse rejects '--noise -30dB', so a value
     ('+30dB', '-30dB'),     # without the minus sign is accepted too
     ('  25dB  ', '-25dB'),
-    ('', '-30dB'),
+    ('', YTPL.DEFAULT_NOISE),
 ])
 def test_normalize_noise(given, expected):
     assert YTPL.normalize_noise(given) == expected
