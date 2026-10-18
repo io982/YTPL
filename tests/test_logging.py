@@ -6,6 +6,8 @@ These tests touch the root logger, so the fixture below puts it back exactly as
 it was - otherwise a leftover handler would follow the rest of the suite.
 """
 import logging
+import os
+import time
 
 import pytest
 
@@ -79,9 +81,14 @@ def test_no_log_file(clean_logging):
 
 def test_unwritable_log_file_is_not_fatal(clean_logging, tmp_path):
     """
-    A log file that cannot be opened must not stop the run.
+    A log file that cannot be opened must not stop the run. A missing folder is
+    simply created, so the broken case here is a plain file sitting where the
+    log folder would have to be.
     """
-    assert YTPL.setup_logging(str(tmp_path / 'no-such-dir' / 'run.log')) is None
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('not a folder', encoding='utf-8')
+
+    assert YTPL.setup_logging(str(blocker / 'run.log')) is None
 
 
 def test_log_environment_records_the_versions(clean_logging, caplog):
@@ -165,3 +172,75 @@ def test_parser_logging_flags():
     assert parser.parse_args(['--log-file', 'other.log']).log_file == 'other.log'
     assert parser.parse_args([]).verbose is False
     assert parser.parse_args(['-v']).verbose is True
+
+def test_default_log_file_is_one_per_session(clean_logging, tmp_path, monkeypatch):
+    """
+    The default name carries the start of the run, so two runs never share a
+    file and a log worth reading or sending is exactly one session.
+    """
+    monkeypatch.chdir(tmp_path)
+    path = YTPL.setup_logging(YTPL.DEFAULT_LOG_FILE)
+
+    assert path != YTPL.DEFAULT_LOG_FILE          # the pattern was expanded
+    assert '%' not in path
+    assert os.path.isfile(path)
+    assert os.path.basename(os.path.dirname(path)) == 'logs'
+
+
+def test_log_file_pattern_is_expanded(clean_logging, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    path = YTPL.setup_logging('run-%Y.log')
+
+    assert path == time.strftime('run-%Y.log')
+    assert os.path.isfile(path)
+
+
+def test_log_folder_is_created(clean_logging, tmp_path):
+    path = YTPL.setup_logging(str(tmp_path / 'deep' / 'nested' / 'run.log'))
+
+    assert path is not None
+    assert os.path.isfile(path)
+
+
+def test_banner_is_intact():
+    """
+    Ten lines of the art end with a backslash, so it has to be a raw string;
+    a plain literal would eat them as escapes.
+    """
+    lines = YTPL.BANNER.strip(chr(10)).split(chr(10))
+
+    assert len(lines) == 21
+    assert sum(1 for l in lines if l.endswith(chr(92))) == 10
+    assert chr(13) not in YTPL.BANNER
+    assert YTPL.BANNER_WIDTH == max(len(l) for l in lines)
+
+
+def test_banner_is_printed_on_a_wide_terminal(capsys, monkeypatch):
+    monkeypatch.setattr(YTPL.shutil, 'get_terminal_size',
+                        lambda *a: os.terminal_size((YTPL.BANNER_WIDTH, 40)))
+    YTPL.print_banner()
+
+    assert YTPL.BANNER.strip(chr(10)) in capsys.readouterr().out
+
+
+def test_narrow_terminal_gets_a_plain_title(capsys, monkeypatch):
+    """
+    Wrapped, the art is unreadable, so a narrow terminal gets a title line.
+    """
+    monkeypatch.setattr(YTPL.shutil, 'get_terminal_size',
+                        lambda *a: os.terminal_size((80, 40)))
+    YTPL.print_banner()
+
+    out = capsys.readouterr().out
+    assert 'YTPL - YouTube To PlayList converter' in out
+    assert chr(92) not in out
+
+
+def test_banner_survives_an_unknown_terminal_size(capsys, monkeypatch):
+    def _boom(*a):
+        raise OSError('no terminal')
+
+    monkeypatch.setattr(YTPL.shutil, 'get_terminal_size', _boom)
+    YTPL.print_banner()
+
+    assert 'YTPL' in capsys.readouterr().out

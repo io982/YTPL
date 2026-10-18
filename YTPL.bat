@@ -2,12 +2,10 @@
 :: UTF-8 console code page: video titles with non-ASCII characters
 :: would otherwise fail to print on Windows
 chcp 65001 >nul
+:: The greeting banner is 84 columns wide; the default 80-column window
+:: would wrap it, and the script would print a plain title instead.
+mode con: cols=90 >nul
 title YTPL - YouTube Playlist Converter
-
-echo ==========================================
-echo         YTPL - YouTube Playlist Converter
-echo ==========================================
-echo.
 
 :: Check if Python is available
 python --version >nul 2>&1

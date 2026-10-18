@@ -1,5 +1,29 @@
 # YTPL - YouTube To PlayList converter
 
+```
+      _____                _____                    _____                    _____
+     |\    \              /\    \                  /\    \                  /\    \
+     |:\____\            /::\    \                /::\    \                /::\____\
+     |::|   |            \:::\    \              /::::\    \              /:::/    /
+     |::|   |             \:::\    \            /::::::\    \            /:::/    /
+     |::|   |              \:::\    \          /:::/\:::\    \          /:::/    /
+     |::|   |               \:::\    \        /:::/__\:::\    \        /:::/    /
+     |::|   |               /::::\    \      /::::\   \:::\    \      /:::/    /
+     |::|___|______        /::::::\    \    /::::::\   \:::\    \    /:::/    /
+     /::::::::\    \      /:::/\:::\    \  /:::/\:::\   \:::\____\  /:::/    /
+    /::::::::::\____\    /:::/  \:::\____\/:::/  \:::\   \:::|    |/:::/____/
+   /:::/~~~~/~~         /:::/    \::/    /\::/    \:::\  /:::|____|\:::\    \
+  /:::/    /           /:::/    / \/____/  \/_____/\:::\/:::/    /  \:::\    \
+ /:::/    /           /:::/    /                    \::::::/    /    \:::\    \
+/:::/    /           /:::/    /                      \::::/    /      \:::\    \
+\::/    /            \::/    /                        \::/____/        \:::\    \
+ \/____/              \/____/                          ~~               \:::\    \
+                                                                         \:::\    \
+                                                                          \:::\____\
+                                                                           \::/    /
+                                                                            \/____/
+```
+
 A Python script that downloads audio from a YouTube video and splits it into
 separate tracks.
 
@@ -40,6 +64,8 @@ explicitly with `--from-description`.
 - imageio-ffmpeg (includes ffmpeg)
 - Node.js - recommended: yt-dlp uses it to decrypt YouTube URLs, otherwise
   downloads are throttled and time out
+- yt-dlp-ejs - YouTube's JS challenge solver; without it downloads fail with
+  HTTP 403
 - pytest - only to run the tests
 
 ## Installation
@@ -79,6 +105,7 @@ Passing a URL as an argument runs the default mode without any questions.
 | `--log-file PATH` | where to write the log (default `ytpl.log`) |
 | `--no-log-file` | do not write a log file |
 | `-v`, `--verbose` | debug output on the console, and yt-dlp's own |
+| `--remote-components ejs:github` | let yt-dlp fetch the JS challenge solver at run time |
 | `--noise 30dB` | silence volume threshold (default `-30dB`; the minus sign may be omitted, or use `--noise=-30dB`) |
 | `--min-silence 1.5` | starting pause-length threshold, seconds |
 | `--floor 0.8` | lowest pause-length threshold, seconds |
@@ -134,9 +161,19 @@ lists every failure.
 
 ## Logging
 
-Every run writes `ytpl.log` next to the output (change it with `--log-file`,
-switch it off with `--no-log-file`). The console stays readable while the file
-records everything at DEBUG: the environment banner (Python, platform, yt-dlp
+Every run writes its own log file, named after the moment it started:
+
+```
+logs/ytpl-20261018-172847.log
+```
+
+So one file is one session - nothing is appended to a shared log, and the file
+you want to read or send is exactly the run you just made. `--log-file` takes
+another path and expands strftime placeholders of its own
+(`--log-file "run-%Y%m%d.log"` gives one file per day); `--no-log-file` switches
+the file off.
+
+The console stays readable while the file records everything at DEBUG: the environment banner (Python, platform, yt-dlp
 and ffmpeg versions), yt-dlp's own messages, the resolved format, and full
 tracebacks. A console line like
 
@@ -174,6 +211,27 @@ test audio is generated locally with ffmpeg. It covers timestamp parsing, the
 silence algorithm (gaps, threshold lowering, hard splitting, short-piece
 merging), mode selection and the actual ffmpeg splitting.
 
+## When every download fails with HTTP 403
+
+YouTube requires its JS challenge (the `n` challenge) to be solved, or the media
+URLs answer 403 on every track. That takes two things: **Node.js** and a
+**solver script**. Node alone is not enough - without the solver the log shows
+
+```
+n challenge solving failed: Some formats may be missing.
+```
+
+The solver installs as an ordinary package:
+
+```bash
+pip install yt-dlp-ejs
+```
+
+The alternative is to let yt-dlp fetch one at run time with
+`--remote-components ejs:github`. That downloads and runs code from an external
+source while the program works, so it is off by default. The solver is checked
+for at startup, and its absence is warned about in the log right away.
+
 ## Error Handling
 
 - `--from-description` with no timestamps in metadata falls back to silence analysis
@@ -193,9 +251,18 @@ merging), mode selection and the actual ffmpeg splitting.
 - **Fixed: a `list=` URL used to crash**, because yt-dlp returned the playlist
   rather than the video and the result has no `duration` field. Single-video
   downloads now pass `noplaylist`
-- **Logging**: a full-detail `ytpl.log`, the environment banner, yt-dlp's own
-  output routed into the log, tracebacks in the file and one line on the
-  console, plus `--log-file` / `--no-log-file` / `-v`
+- **Logging**: one full-detail log file per run under `logs/`, named after the
+  start of the session, with the environment banner, yt-dlp's own output routed
+  into the log, tracebacks in the file and one line on the console, plus
+  `--log-file` / `--no-log-file` / `-v`
+- **Greeting banner** on startup; a terminal narrower than 84 columns gets a
+  plain title line instead of wrapped art
+- **A missing JS challenge solver is now reported** at startup and on every 403,
+  instead of leaving hundreds of tracks to fail without a stated reason;
+  `--remote-components` allows a remote one
+- **Fixed: a wedged `node --version` could hang the whole run.** Node is probed
+  once with a timeout, and the run carries on without the runtime if it does
+  not answer
 
 - **Silence analysis is now the default; chapters and description are used only
   with `--from-description`**

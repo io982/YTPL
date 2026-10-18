@@ -5,23 +5,72 @@ import sys
 import math
 import argparse
 import platform
+import shutil
 import subprocess
 import urllib.parse
 import imageio_ffmpeg
 import requests
 from bs4 import BeautifulSoup
 import tempfile
+import time
 import logging
 
-# Logging setup
+# Greeting banner. The art is a raw string: ten of its lines end with a
+# backslash, which a plain literal would read as an escape.
+BANNER = r"""
+      _____                _____                    _____                    _____
+     |\    \              /\    \                  /\    \                  /\    \
+     |:\____\            /::\    \                /::\    \                /::\____\
+     |::|   |            \:::\    \              /::::\    \              /:::/    /
+     |::|   |             \:::\    \            /::::::\    \            /:::/    /
+     |::|   |              \:::\    \          /:::/\:::\    \          /:::/    /
+     |::|   |               \:::\    \        /:::/__\:::\    \        /:::/    /
+     |::|   |               /::::\    \      /::::\   \:::\    \      /:::/    /
+     |::|___|______        /::::::\    \    /::::::\   \:::\    \    /:::/    /
+     /::::::::\    \      /:::/\:::\    \  /:::/\:::\   \:::\____\  /:::/    /
+    /::::::::::\____\    /:::/  \:::\____\/:::/  \:::\   \:::|    |/:::/____/
+   /:::/~~~~/~~         /:::/    \::/    /\::/    \:::\  /:::|____|\:::\    \
+  /:::/    /           /:::/    / \/____/  \/_____/\:::\/:::/    /  \:::\    \
+ /:::/    /           /:::/    /                    \::::::/    /    \:::\    \
+/:::/    /           /:::/    /                      \::::/    /      \:::\    \
+\::/    /            \::/    /                        \::/____/        \:::\    \
+ \/____/              \/____/                          ~~               \:::\    \
+                                                                         \:::\    \
+                                                                          \:::\____\
+                                                                           \::/    /
+                                                                            \/____/
+"""
+BANNER_WIDTH = 84
+
+# Logging setup. The default log file carries the start of the run, so every
+# session gets its own file instead of appending to a shared one: a log you
+# want to read or send is then exactly one run. strftime placeholders are
+# expanded, so --log-file takes a pattern of its own just as well.
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
-DEFAULT_LOG_FILE = 'ytpl.log'
+DEFAULT_LOG_FILE = os.path.join('logs', 'ytpl-%Y%m%d-%H%M%S.log')
 
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
 # Whether to ask yt-dlp for its own debug output; set by setup_logging().
 _ytdlp_verbose = False
+
+# Remote components yt-dlp may fetch; set from --remote-components.
+_remote_components = []
+
+# Cached result of node_is_usable(), so the probe runs once per process.
+_node_checked = None
+
+# How long to wait for 'node --version' before giving up on the runtime.
+NODE_PROBE_TIMEOUT = 10
+
+# A 403 on the media URL almost always means YouTube's JS challenge went
+# unsolved, which needs both Node.js and the solver script.
+HTTP_403_HINT = (
+    "A 403 here almost always means YouTube's JS challenge was not solved. "
+    "Install the solver with 'pip install yt-dlp-ejs' (Node.js is required too), "
+    "or let yt-dlp fetch one with --remote-components ejs:github."
+)
 
 # Ways of finding cut points.
 #   MODE_SILENCE - silence analysis. The default: on mixes, author timestamps
@@ -137,7 +186,12 @@ def setup_logging(log_file=DEFAULT_LOG_FILE, verbose=False):
     if not log_file:
         return None
 
+    # 'logs/ytpl-%Y%m%d-%H%M%S.log' -> 'logs/ytpl-20260118-174500.log'
+    log_file = time.strftime(log_file)
     try:
+        directory = os.path.dirname(log_file)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
     except OSError as e:
         logger.warning(f"Could not open the log file {log_file}: {e}")
@@ -147,6 +201,53 @@ def setup_logging(log_file=DEFAULT_LOG_FILE, verbose=False):
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
     root.addHandler(file_handler)
     return log_file
+
+
+def node_is_usable(timeout=NODE_PROBE_TIMEOUT):
+    """
+    Whether Node.js answers 'node --version' within the timeout.
+
+    yt-dlp probes the JavaScript runtime the same way but without a deadline,
+    so a node process that wedges on startup takes the whole run down with it:
+    it sits there with a single thread and no CPU while the download waits
+    forever. Checking with a timeout means such a run carries on (and fails
+    fast) instead of hanging.
+    """
+    try:
+        result = subprocess.run(['node', '--version'], capture_output=True,
+                                text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Node.js did not answer within {timeout}s - continuing "
+                       "without a JavaScript runtime (downloads may fail with 403)")
+        return False
+    except OSError as e:
+        logger.warning(f"Node.js is not available ({e}) - continuing without a "
+                       "JavaScript runtime (downloads may fail with 403)")
+        return False
+
+    if result.returncode != 0:
+        logger.warning(f"'node --version' failed with code {result.returncode} - "
+                       "continuing without a JavaScript runtime")
+        return False
+
+    logger.debug(f"Node.js {result.stdout.strip()} answered the probe")
+    return True
+
+
+def print_banner():
+    """
+    Greeting. The art needs BANNER_WIDTH columns, so a narrower terminal gets a
+    plain title line instead of a wrapped, unreadable banner.
+    """
+    try:
+        width = shutil.get_terminal_size().columns
+    except Exception:
+        width = 80
+    if width >= BANNER_WIDTH:
+        print(BANNER)
+    else:
+        print('YTPL - YouTube To PlayList converter')
+        print()
 
 
 def log_environment():
@@ -162,6 +263,13 @@ def log_environment():
                     f"at {imageio_ffmpeg.get_ffmpeg_exe()}")
     except Exception as e:
         logger.warning(f"Could not query ffmpeg: {e}")
+    try:
+        import yt_dlp_ejs
+        logger.info("yt-dlp-ejs (JS challenge solver): "
+                    f"{getattr(yt_dlp_ejs, '__version__', 'installed')}")
+    except ImportError:
+        logger.warning("yt-dlp-ejs is not installed. " + HTTP_403_HINT)
+
     logger.debug(f"Working directory: {os.getcwd()}")
     logger.debug(f"Command line: {' '.join(sys.argv)}")
 
@@ -400,14 +508,16 @@ def detect_silence_timestamps(audio_path, duration, noise_tol='-30dB',
     return cuts
 
 
-def download_audio(url, verbose=None):
+def download_audio(url, verbose=None, remote_components=None):
     """
     Download audio from YouTube video using yt-dlp.
     Returns path to downloaded MP3 file, title, description, duration, chapters, temp_dir_path.
 
     Parameters:
-        verbose - ask yt-dlp for its own debug output; None uses what
-                  setup_logging() was given.
+        verbose           - ask yt-dlp for its own debug output; None uses what
+                            setup_logging() was given.
+        remote_components - components yt-dlp may fetch when it needs one;
+                            None uses what --remote-components was given.
     """
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     temp_dir_path = tempfile.mkdtemp(prefix='ytpl_audio_')
@@ -426,9 +536,22 @@ def download_audio(url, verbose=None):
         'retries': 10,              # download retry attempts
         'fragment_retries': 10,     # retries for fragmented streams
         'http_chunk_size': 10485760, # 10 MB chunks - help on an unstable connection
-        'js_runtimes': {'node': {}}, # use the installed Node.js to decrypt YouTube URLs (otherwise throttling and timeouts)
         'noplaylist': True,         # a '&list=' URL means this video only; playlists are walked by process_playlist
     }
+
+    # Node decrypts YouTube's URLs; without it formats go missing and the media
+    # URLs come back 403. Only offered to yt-dlp once it has answered a probe,
+    # because a wedged node would otherwise block the download indefinitely.
+    global _node_checked
+    if _node_checked is None:
+        _node_checked = node_is_usable()
+    if _node_checked:
+        ydl_opts['js_runtimes'] = {'node': {}}
+
+    components = _remote_components if remote_components is None else remote_components
+    if components:
+        ydl_opts['remote_components'] = list(components)
+        logger.debug(f"Remote components allowed: {components}")
     logger.debug(f"Downloading {url} into {temp_dir_path}")
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -437,6 +560,8 @@ def download_audio(url, verbose=None):
         # One line on the console, the whole traceback in the log file.
         logger.error(f"Download failed for {url}: {e}")
         logger.debug("Download traceback", exc_info=True)
+        if '403' in str(e):
+            logger.error(HTTP_403_HINT)
         raise
 
     title = info['title']
@@ -614,7 +739,6 @@ def process_youtube_video(url, manual_timestamps=None, mode=MODE_SILENCE,
         # Clean up the temporary files
         if temp_dir_path and os.path.exists(temp_dir_path):
             try:
-                import shutil
                 shutil.rmtree(temp_dir_path)
                 logger.info(f"Temporary files removed: {temp_dir_path}")
             except Exception as cleanup_error:
@@ -862,11 +986,21 @@ def build_parser():
 
     g = p.add_argument_group('logging')
     g.add_argument('--log-file', default=DEFAULT_LOG_FILE, metavar='PATH',
-                   help='write a full-detail log to this file')
+                   help='write a full-detail log to this file; strftime '
+                        'placeholders are expanded, so the default gives one '
+                        'file per run')
     g.add_argument('--no-log-file', dest='log_file', action='store_const', const=None,
                    help='do not write a log file')
     g.add_argument('-v', '--verbose', action='store_true',
                    help="show debug output on the console and ask yt-dlp for its own")
+
+    g = p.add_argument_group('downloading')
+    g.add_argument('--remote-components', metavar='COMPONENT', action='append',
+                   help="let yt-dlp fetch a remote component when it needs one, "
+                        "e.g. 'ejs:github' for YouTube's JS challenge solver. It "
+                        "downloads and runs code from that source at run time, so "
+                        "it is off by default; 'pip install yt-dlp-ejs' is the "
+                        "local alternative. Repeat the flag for several components")
 
     g = p.add_argument_group('silence analysis settings')
     g.add_argument('--noise', default='-30dB', metavar='dB',
@@ -961,7 +1095,9 @@ def silence_opts_from_args(args):
 if __name__ == "__main__":
     args = build_parser().parse_args()
 
+    print_banner()
     log_path = setup_logging(args.log_file, args.verbose)
+    _remote_components = args.remote_components or []
     log_environment()
     if log_path:
         print(f"Log file: {log_path}")
