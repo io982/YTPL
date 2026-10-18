@@ -58,6 +58,26 @@ _ytdlp_verbose = False
 # Remote components yt-dlp may fetch; set from --remote-components.
 _remote_components = []
 
+# ffmpeg and node speak UTF-8. Decoding them with the system code page
+# instead - which is what text=True does - raises on the first byte it cannot
+# map: a track with a Korean title made ffmpeg print one, and the exception
+# landed in subprocess's reader thread, taking that output with it. Losing
+# ffmpeg's output is not cosmetic: silencedetect's findings are parsed out of
+# it, and without them a track is silently left unsplit.
+SUBPROCESS_TEXT = {'capture_output': True, 'text': True,
+                   'encoding': 'utf-8', 'errors': 'replace'}
+
+# What a second of audio costs on disk once converted. ffmpeg is asked for
+# '-q:a 0', which measured 31857 bytes a second over the first dozen tracks of
+# a real playlist - about 109 MB per hour of audio.
+BYTES_PER_SECOND = 32000
+
+# A run stops rather than filling the disk to the last byte.
+DEFAULT_MIN_FREE_MB = 500
+
+# Every download works in its own folder under the system temp directory.
+TEMP_PREFIX = 'ytpl_audio_'
+
 # A file by this name asks a playlist run to stop at the next track boundary.
 STOP_FILE = 'STOP'
 
@@ -226,6 +246,99 @@ def setup_logging(log_file=DEFAULT_LOG_FILE, verbose=False):
     return log_file
 
 
+def format_size(num_bytes):
+    """
+    Bytes as something readable: 512 KB, 7.9 MB, 3.4 GB.
+    """
+    size = float(num_bytes)
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if abs(size) < 1024 or unit == 'GB':
+            return f"{int(size)} B" if unit == 'B' else f"{size:.1f} {unit}"
+        size /= 1024
+
+
+def estimate_download_size(entries):
+    """
+    Roughly what a playlist will take on disk, from the durations in its
+    listing. Entries whose duration YouTube did not give are charged the
+    average of those it did, so a few unknowns do not flatter the estimate.
+
+    Returns bytes, or 0 when no duration is known at all.
+    """
+    known = [e['duration'] for e in entries if e.get('duration')]
+    if not known:
+        return 0
+    average = sum(known) / len(known)
+    total = sum(e.get('duration') or average for e in entries)
+    return int(total * BYTES_PER_SECOND)
+
+
+def free_space(path):
+    """
+    Free bytes on the volume holding path, or None when that cannot be read.
+    The path itself need not exist yet - its nearest existing parent is used.
+    """
+    probe = os.path.abspath(path)
+    while not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return None
+        probe = parent
+    try:
+        return shutil.disk_usage(probe).free
+    except OSError as e:
+        logger.debug(f"Could not read the free space on {probe}: {e}")
+        return None
+
+
+def clean_stale_temp_dirs(older_than_minutes=10):
+    """
+    Remove temp folders left behind by earlier runs.
+
+    Each download works in its own folder and removes it when it is done, but
+    a run that is killed never gets that far, and a few of those leave
+    hundreds of megabytes in the temp directory.
+
+    Folders younger than the cutoff are left alone in case another run is
+    working in one; on Windows a folder in use cannot be deleted anyway, and
+    the attempt is made quietly.
+
+    Returns the number of folders removed.
+    """
+    cutoff = time.time() - older_than_minutes * 60
+    root = tempfile.gettempdir()
+    removed = 0
+
+    try:
+        names = os.listdir(root)
+    except OSError as e:
+        logger.debug(f"Could not list the temp directory: {e}")
+        return 0
+
+    for name in names:
+        if not name.startswith(TEMP_PREFIX):
+            continue
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            if os.path.getmtime(path) > cutoff:
+                continue
+        except OSError:
+            continue
+
+        shutil.rmtree(path, ignore_errors=True)
+        if os.path.exists(path):
+            logger.debug(f"Temp folder {name} is still in use, left alone")
+        else:
+            removed += 1
+            logger.debug(f"Removed stale temp folder {name}")
+
+    if removed:
+        logger.info(f"Removed {removed} temp folder(s) left by earlier runs")
+    return removed
+
+
 def warn_403_once(error):
     """
     Say the 403 hint on the console the first time a track is given up on for
@@ -253,8 +366,8 @@ def node_is_usable(timeout=NODE_PROBE_TIMEOUT):
     fast) instead of hanging.
     """
     try:
-        result = subprocess.run(['node', '--version'], capture_output=True,
-                                text=True, timeout=timeout)
+        result = subprocess.run(['node', '--version'], timeout=timeout,
+                                **SUBPROCESS_TEXT)
     except subprocess.TimeoutExpired:
         logger.warning(f"Node.js did not answer within {timeout}s - continuing "
                        "without a JavaScript runtime (downloads may fail with 403)")
@@ -404,7 +517,7 @@ def _run_silencedetect(audio_path, noise_tol, min_silence_dur):
         '-af', f'silencedetect=n={noise_tol}:d={min_silence_dur}',
         '-f', 'null', '-'
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, **SUBPROCESS_TEXT)
 
     silence_starts = []
     silence_ends = []
@@ -564,7 +677,7 @@ def download_audio(url, verbose=None, remote_components=None):
                             None uses what --remote-components was given.
     """
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    temp_dir_path = tempfile.mkdtemp(prefix='ytpl_audio_')
+    temp_dir_path = tempfile.mkdtemp(prefix=TEMP_PREFIX)
     outtmpl = os.path.join(temp_dir_path, 'audio.%(ext)s')
 
     ydl_opts = {
@@ -641,7 +754,7 @@ def download_audio(url, verbose=None, remote_components=None):
         cmd = [ffmpeg_path, '-i', downloaded_file, '-q:a', '0', '-y', mp3_file]
         # Captured, or ffmpeg's progress meter lands on top of the console's
         # own status line.
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, **SUBPROCESS_TEXT)
         if result.returncode != 0:
             logger.debug(f"ffmpeg said:{chr(10)}{result.stderr}")
             raise RuntimeError(f"ffmpeg could not convert {ext} to mp3 "
@@ -692,14 +805,16 @@ def split_audio(audio_path, timestamps, duration, base_name='video', output_dir=
     logger.info(f"Creating {len(segments)} segments")
 
     for i, (start_time, end_time) in enumerate(segments):
-        segment_num = f"{i+1:04d}"
-        output_filename = os.path.join(output_dir, f"{base_name}_{segment_num}.mp3")
+        # A track that was not split is just itself; the segment number would
+        # only be noise on it.
+        suffix = f"_{i + 1:04d}" if len(segments) > 1 else ""
+        output_filename = os.path.join(output_dir, f"{base_name}{suffix}.mp3")
         duration_seg = end_time - start_time
 
         logger.info(f"Segment {i+1}/{len(segments)}: {start_time}s - {end_time}s ({duration_seg:.1f}s)")
 
         cmd = [ffmpeg_path, '-i', audio_path, '-ss', str(start_time), '-t', str(duration_seg), '-c', 'copy', output_filename]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, **SUBPROCESS_TEXT)
 
         if result.returncode != 0:
             logger.error(f"Failed to create segment {i+1}: {result.stderr}")
@@ -818,8 +933,8 @@ def fetch_playlist_entries(url):
     per-video metadata, so a 400+ track playlist takes a few seconds.
 
     Returns:
-        (playlist title, [{'id', 'title', 'url'}, ...], number of unavailable
-        entries). A URL that is not a playlist yields (None, [], 0).
+        (playlist title, [{'id', 'title', 'url', 'duration'}, ...], number of
+        unavailable entries). A URL that is not a playlist yields (None, [], 0).
     """
     ydl_opts = {
         'quiet': True,
@@ -846,6 +961,9 @@ def fetch_playlist_entries(url):
             'id': entry['id'],
             'title': entry['title'],
             'url': entry.get('url') or f"https://www.youtube.com/watch?v={entry['id']}",
+            # Flat listings carry the duration, which is what the size of the
+            # whole playlist can be estimated from before anything is fetched.
+            'duration': entry.get('duration'),
         })
     return info.get('title'), entries, unavailable
 
@@ -862,38 +980,104 @@ def prompt_playlist(playlist_title, count):
     return input("Choice: ").strip().lower() not in ('o', 'one', 'single', 'n', 'no')
 
 
+def track_file_pattern(base_name):
+    """
+    Matches the files one track leaves behind: '<base_name>.mp3' when it was
+    not split, '<base_name>_0001.mp3' and so on when it was. Anchored at both
+    ends, so one track's name cannot match another's ('Song' must not answer
+    for 'Song_Extended').
+    """
+    return re.compile(re.escape(base_name) + r'(_\d{4})?\.mp3$', re.IGNORECASE)
+
+
+def track_files(directory, base_name):
+    """
+    The files already in the folder for this track, in name order.
+    """
+    pattern = track_file_pattern(base_name)
+    try:
+        return sorted(f for f in os.listdir(directory) if pattern.match(f))
+    except OSError:
+        return []
+
+
 def track_is_done(directory, base_name):
     """
-    Whether this track's segments are already in the folder, so a rerun can
-    skip it: on a long playlist a dropped connection should not mean starting
-    over. Every track of a playlist shares one folder, so the match is on the
-    track's own '<base_name>_0001.mp3' names and nothing else.
+    Whether this track is already in the folder, so a rerun can skip it: on a
+    long playlist a dropped connection should not mean starting over. All the
+    tracks share one folder, so the match is on this track's own names.
     """
-    pattern = re.compile(re.escape(base_name) + r'_\d{4}\.mp3$', re.IGNORECASE)
-    try:
-        return any(pattern.match(f) for f in os.listdir(directory))
-    except OSError:
-        return False
+    return bool(track_files(directory, base_name))
 
 
 def remove_track_files(directory, base_name):
     """
-    Delete a track's segments. Used when a run is interrupted part way through
-    a track: what is on disk is incomplete, and leaving it would make the next
+    Delete a track's files. Used when a run is interrupted part way through a
+    track: what is on disk is incomplete, and leaving it would make the next
     run treat the track as finished.
     """
-    pattern = re.compile(re.escape(base_name) + r'_\d{4}\.mp3$', re.IGNORECASE)
-    try:
-        names = os.listdir(directory)
-    except OSError:
-        return
-    for name in names:
-        if pattern.match(name):
+    for name in track_files(directory, base_name):
+        try:
+            os.remove(os.path.join(directory, name))
+            logger.debug(f"Removed incomplete file {name}")
+        except OSError as e:
+            logger.warning(f"Could not remove {name}: {e}")
+
+
+def track_base_name(position, title, digits=3):
+    """
+    The file name for a playlist track: its place in the playlist, then the
+    title - '001-Sun_City_-_Restless_Heart'. The number first is what keeps a
+    folder of several hundred tracks in playlist order in any file manager.
+    """
+    return f"{position:0{digits}d}-{sanitize_name(title)}"
+
+
+def number_width(total):
+    """
+    Digits enough for the largest position, three at the least, so 426 tracks
+    are 001..426 and a thousand are 0001..1000.
+    """
+    return max(3, len(str(total)))
+
+
+def renumber_existing_tracks(root, entries, digits=3):
+    """
+    Give files downloaded before the numbering existed the number they now
+    carry, so a rerun recognises them instead of fetching them again.
+
+    Returns the number of files renamed.
+    """
+    renamed = 0
+    for position, entry in enumerate(entries, 1):
+        old_base = sanitize_name(entry['title'])
+        new_base = track_base_name(position, entry['title'], digits)
+        if old_base == new_base:
+            continue
+
+        pattern = track_file_pattern(old_base)
+        try:
+            names = os.listdir(root)
+        except OSError:
+            return renamed
+
+        for name in names:
+            match = pattern.match(name)
+            if not match:
+                continue
+            target = new_base + (match.group(1) or '') + '.mp3'
+            if os.path.exists(os.path.join(root, target)):
+                continue
             try:
-                os.remove(os.path.join(directory, name))
-                logger.debug(f"Removed incomplete segment {name}")
+                os.replace(os.path.join(root, name), os.path.join(root, target))
+                renamed += 1
+                logger.debug(f"Renamed {name} -> {target}")
             except OSError as e:
-                logger.warning(f"Could not remove {name}: {e}")
+                logger.warning(f"Could not rename {name}: {e}")
+
+    if renamed:
+        logger.info(f"Numbered {renamed} file(s) from earlier runs")
+    return renamed
 
 
 def flatten_playlist_folder(root):
@@ -981,20 +1165,53 @@ def check_controls(directory='.'):
     key = _read_key()
 
     if key in ('s', 'q') or stop_requested(directory):
+        logger.info("Stop requested" + (f" with [{key}]" if key else
+                                        f" by the {STOP_FILE} file"))
         return 'stop'
 
     if key == 'p':
-        _line("  paused - press [p] to carry on, [s] to stop")
+        # Logged, not just printed: a run sitting still is the first thing to
+        # explain afterwards, and the console scrollback is not evidence.
+        logger.info("Paused by the user")
+        _line("")
+        print("*" * 52)
+        print("***  PAUSED  ***   [p] carry on   [s] stop")
+        print("*" * 52)
         while True:
             key = _read_key()
             if key == 'p':
-                _line("  carrying on")
+                logger.info("Resumed by the user")
+                _line("carrying on")
                 return None
             if key in ('s', 'q') or stop_requested(directory):
+                logger.info("Stop requested while paused")
                 return 'stop'
             time.sleep(0.2)
 
     return None
+
+
+def _console_safe(text):
+    """
+    Text this console can actually encode.
+
+    A track title can hold characters the console's code page has no room for
+    (Korean on a cp866 console), and print would raise UnicodeEncodeError -
+    from outside the per-track error handling, so the whole run would end over
+    a track that downloaded perfectly well.
+    """
+    encoding = getattr(sys.stdout, 'encoding', None) or 'utf-8'
+    try:
+        return text.encode(encoding, 'replace').decode(encoding, 'replace')
+    except (LookupError, UnicodeError):
+        return text.encode('ascii', 'replace').decode('ascii')
+
+
+def _print(text=''):
+    """
+    print() that cannot fall over an unencodable character.
+    """
+    print(_console_safe(text))
 
 
 def _console_width():
@@ -1010,7 +1227,7 @@ def _status(text):
     per update.
     """
     width = max(_console_width() - 1, 20)
-    print('\r' + text[:width].ljust(width), end='', flush=True)
+    print('\r' + _console_safe(text)[:width].ljust(width), end='', flush=True)
 
 
 def _line(text):
@@ -1018,13 +1235,14 @@ def _line(text):
     Finish the status line and leave text in its place.
     """
     width = max(_console_width() - 1, 20)
-    print('\r' + text[:width].ljust(width))
+    print('\r' + _console_safe(text)[:width].ljust(width))
 
 
 def process_playlist(playlist_title, entries, unavailable=0, manual_timestamps=None,
                      mode=MODE_SILENCE, silence_opts=None, overwrite=False,
                      max_failures=DEFAULT_MAX_FAILURES,
-                     attempts=DEFAULT_TRACK_ATTEMPTS):
+                     attempts=DEFAULT_TRACK_ATTEMPTS,
+                     min_free_mb=DEFAULT_MIN_FREE_MB):
     """
     Process every video of a playlist. Each track goes through the same
     pipeline as a single video, so its pauses are analysed the same way, and
@@ -1032,6 +1250,10 @@ def process_playlist(playlist_title, entries, unavailable=0, manual_timestamps=N
 
     The console keeps one status line and one line per finished track; the
     details go to the log file.
+
+    The size of the whole playlist is estimated from the listing and shown
+    against the free space, and the run stops rather than leaving the disk with
+    less than min_free_mb on it.
 
     A track is tried attempts times before being counted as failed: YouTube
     picks a different player client each extraction and some of them answer 403
@@ -1051,7 +1273,9 @@ def process_playlist(playlist_title, entries, unavailable=0, manual_timestamps=N
     """
     root = sanitize_name(playlist_title or 'playlist')
     os.makedirs(root, exist_ok=True)
+    digits = number_width(len(entries))
     flatten_playlist_folder(root)
+    renumber_existing_tracks(root, entries, digits)
 
     total = len(entries)
     logger.info(f"Playlist: {playlist_title} - {total} tracks, output folder {root}/")
@@ -1060,12 +1284,26 @@ def process_playlist(playlist_title, entries, unavailable=0, manual_timestamps=N
     if manual_timestamps:
         logger.warning("Manual timestamps are applied to every track of the playlist")
 
-    print(f"Playlist: {playlist_title}")
-    print(f"{total} tracks -> {root}/")
+    needed = estimate_download_size(entries)
+    free = free_space(root)
+
+    _print(f"Playlist: {playlist_title}")
+    _print(f"{total} tracks -> {root}/")
+    if needed:
+        room = f"About {format_size(needed)} needed"
+        if free is not None:
+            room += f", {format_size(free)} free"
+        logger.info(room)
+        _print(room)
+        if free is not None and free < needed:
+            short = (f"That is more than the disk has - about "
+                     f"{format_size(needed - free)} short")
+            logger.warning(short)
+            _print("*** " + short)
     if unavailable:
-        print(f"({unavailable} unavailable entries skipped)")
+        _print(f"({unavailable} unavailable entries skipped)")
     print("Keys: [p] pause   [s] stop after this track   [Ctrl+C] stop now")
-    print(f"      (or create the file {STOP_FILE} in {os.path.abspath('.')})")
+    print(f"      (or create a file named {STOP_FILE} in the folder you ran this from)")
     print()
 
     created = []
@@ -1078,13 +1316,26 @@ def process_playlist(playlist_title, entries, unavailable=0, manual_timestamps=N
     for i, entry in enumerate(entries, 1):
         # The file name is fixed here rather than taken from the title fetched
         # at download time: the two can differ, and then a rerun would
-        # re-download a track that is already on disk.
-        track_name = sanitize_name(entry['title'])
+        # re-download a track that is already on disk. It carries the track's
+        # place in the playlist, so the folder stays in playlist order.
+        track_name = track_base_name(i, entry['title'], digits)
         left = total - i
 
         if check_controls() == 'stop':
             stopped_at, stop_reason = i, 'asked to stop'
             break
+
+        # Checked every track: an estimate made at the start cannot know what
+        # else fills the disk meanwhile, and a disk with nothing left on it is
+        # a far worse way to find out.
+        if min_free_mb:
+            left = free_space(root)
+            if left is not None and left < min_free_mb * 1024 * 1024:
+                stopped_at = i
+                stop_reason = f"only {format_size(left)} left on disk"
+                logger.error(f"Stopping before track {i}: {stop_reason}")
+                _line(f"[{i}/{total}] stopping - {stop_reason}")
+                break
 
         if not overwrite and track_is_done(root, track_name):
             skipped += 1
@@ -1144,19 +1395,19 @@ def process_playlist(playlist_title, entries, unavailable=0, manual_timestamps=N
 
     done = (stopped_at if stopped_at else total) - len(failed) - skipped
 
-    print(f"\n{'='*50}")
-    print(f"Playlist {'stopped' if stopped_at else 'finished'}: {playlist_title}")
-    print(f"Tracks processed: {done}/{total}")
+    _print(f"\n{'='*50}")
+    _print(f"Playlist {'stopped' if stopped_at else 'finished'}: {playlist_title}")
+    _print(f"Tracks processed: {done}/{total}")
     if skipped:
-        print(f"Already downloaded, skipped: {skipped}")
-    print(f"Segments created: {len(created)}")
-    print(f"Output folder: {root}/")
+        _print(f"Already downloaded, skipped: {skipped}")
+    _print(f"Segments created: {len(created)}")
+    _print(f"Output folder: {root}/")
     if failed:
-        print(f"Failed tracks: {len(failed)}")
+        _print(f"Failed tracks: {len(failed)}")
         for title in failed[-10:]:
-            print(f"  - {title}")
+            _print(f"  - {title}")
         if len(failed) > 10:
-            print(f"  ... {len(failed) - 10} more, see the log")
+            _print(f"  ... {len(failed) - 10} more, see the log")
     if stopped_at:
         print(f"Stopped at track {stopped_at} of {total} ({stop_reason}).")
         print("Run the same command again to carry on from there.")
@@ -1191,7 +1442,8 @@ def _process_single(url, manual_timestamps=None, mode=MODE_SILENCE, silence_opts
 def process_url(url, manual_timestamps=None, mode=MODE_SILENCE, silence_opts=None,
                 playlist_choice=None, interactive=None, overwrite=False,
                 max_failures=DEFAULT_MAX_FAILURES,
-                attempts=DEFAULT_TRACK_ATTEMPTS):
+                attempts=DEFAULT_TRACK_ATTEMPTS,
+                min_free_mb=DEFAULT_MIN_FREE_MB):
     """
     Top-level entry point: works out whether the URL means a single video or a
     whole playlist, then hands over to the matching function.
@@ -1204,6 +1456,7 @@ def process_url(url, manual_timestamps=None, mode=MODE_SILENCE, silence_opts=Non
         interactive     - overrides the automatic detection of an interactive run.
         max_failures    - consecutive track failures that end a playlist run.
         attempts        - tries per track before it counts as failed.
+        min_free_mb     - stop rather than leave the disk with less than this.
 
     Returns list of created segment paths.
     """
@@ -1233,8 +1486,23 @@ def process_url(url, manual_timestamps=None, mode=MODE_SILENCE, silence_opts=Non
     if not playlist_choice:
         return _process_single(url, manual_timestamps, mode, silence_opts)
 
+    needed = estimate_download_size(entries)
+    free = free_space('.')
+    if needed and free is not None and free < needed:
+        logger.warning(f"The playlist needs about {format_size(needed)}, "
+                       f"{format_size(free)} free")
+        _print(f"This playlist needs about {format_size(needed)} and there is "
+               f"{format_size(free)} free.")
+        if interactive:
+            if input("Start anyway? (y/n): ").strip().lower() not in ('y', 'yes'):
+                _print("Nothing downloaded.")
+                return []
+        else:
+            _print("Starting anyway; it will stop before the disk fills.")
+
     return process_playlist(playlist_title, entries, unavailable, manual_timestamps,
-                            mode, silence_opts, overwrite, max_failures, attempts)
+                            mode, silence_opts, overwrite, max_failures, attempts,
+                            min_free_mb)
 
 
 class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
@@ -1284,6 +1552,10 @@ def build_parser():
                    help='tries per track before it counts as failed; YouTube '
                         'answers 403 on some of its own player clients, and a '
                         'second go usually lands on a working one')
+    g.add_argument('--min-free', type=int, default=DEFAULT_MIN_FREE_MB,
+                   metavar='MB',
+                   help='stop the run rather than leave the disk with less '
+                        'free space than this; 0 turns the check off')
     g.add_argument('--max-failures', type=int, default=DEFAULT_MAX_FAILURES,
                    metavar='N',
                    help='end a playlist run after this many track failures in '
@@ -1408,6 +1680,7 @@ if __name__ == "__main__":
     log_path = setup_logging(args.log_file, args.verbose)
     _remote_components = args.remote_components or []
     log_environment()
+    clean_stale_temp_dirs()
     if log_path:
         print(f"Log file: {log_path}")
 
@@ -1434,7 +1707,8 @@ if __name__ == "__main__":
     try:
         process_url(url, manual_timestamps, mode=mode, silence_opts=silence_opts,
                     playlist_choice=args.playlist, overwrite=args.overwrite,
-                    max_failures=args.max_failures, attempts=args.attempts)
+                    max_failures=args.max_failures, attempts=args.attempts,
+                    min_free_mb=args.min_free)
     except KeyboardInterrupt:
         logger.info("\nOperation cancelled by the user")
     except Exception as e:

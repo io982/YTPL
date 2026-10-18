@@ -144,7 +144,8 @@ def spy_process(monkeypatch):
     def _playlist(playlist_title, entries, unavailable=0, manual_timestamps=None,
                   mode=YTPL.MODE_SILENCE, silence_opts=None, overwrite=False,
                   max_failures=YTPL.DEFAULT_MAX_FAILURES,
-                  attempts=YTPL.DEFAULT_TRACK_ATTEMPTS):
+                  attempts=YTPL.DEFAULT_TRACK_ATTEMPTS,
+                  min_free_mb=YTPL.DEFAULT_MIN_FREE_MB):
         calls.append(('playlist', playlist_title, len(entries)))
         return ['many.mp3']
 
@@ -293,7 +294,7 @@ def track_runner(monkeypatch, tmp_path):
         seen.modes.append(mode)
         seen.opts.append(silence_opts)
         os.makedirs(output_dir, exist_ok=True)
-        created = os.path.join(output_dir, f'{base_name}_0001.mp3')
+        created = os.path.join(output_dir, f'{base_name}.mp3')
         open(created, 'wb').close()
         if url in seen.interrupt:
             # Interrupted after writing a segment, as a real run would be.
@@ -318,15 +319,16 @@ def test_playlist_processes_every_track(track_runner):
 
 def test_all_tracks_land_in_one_folder(track_runner):
     """
-    One folder for the whole playlist, not a folder per track.
+    One folder for the whole playlist, not a folder per track, and each file
+    numbered by its place in the playlist so the folder sorts in order.
     """
     YTPL.process_playlist('My Mix', _entries(3))
 
     assert track_runner.dirs == ['My_Mix'] * 3
     folder = track_runner.tmp_path / 'My_Mix'
-    assert sorted(os.listdir(folder)) == ['Track_0_0001.mp3',
-                                          'Track_1_0001.mp3',
-                                          'Track_2_0001.mp3']
+    assert sorted(os.listdir(folder)) == ['001-Track_0.mp3',
+                                          '002-Track_1.mp3',
+                                          '003-Track_2.mp3']
     assert [p for p in folder.iterdir() if p.is_dir()] == []
 
 
@@ -337,7 +339,16 @@ def test_file_names_come_from_the_playlist_entries(track_runner):
     """
     YTPL.process_playlist('My Mix', _entries(2))
 
-    assert track_runner.names == ['Track_0', 'Track_1']
+    assert track_runner.names == ['001-Track_0', '002-Track_1']
+
+
+def test_numbering_widens_for_a_long_playlist(track_runner):
+    YTPL.process_playlist('My Mix', _entries(2))
+    assert track_runner.names[0] == '001-Track_0'
+
+    track_runner.names.clear()
+    YTPL.process_playlist('Big Mix', _entries(1200)[:2])
+    assert track_runner.names[0] == '001-Track_0'      # width follows the count given
 
 
 def test_playlist_keeps_the_silence_mode_for_each_track(track_runner):
@@ -421,7 +432,7 @@ def test_interrupted_track_is_rolled_back(track_runner):
     YTPL.process_playlist('My Mix', _entries(4))
 
     folder = track_runner.tmp_path / 'My_Mix'
-    assert os.listdir(folder) == ['Track_0_0001.mp3']
+    assert os.listdir(folder) == ['001-Track_0.mp3']
 
 
 def test_rerun_after_ctrl_c_carries_on(track_runner):
@@ -575,8 +586,8 @@ def test_flattening_does_not_overwrite(tmp_path):
 
 def test_old_layout_is_picked_up_as_done(track_runner):
     """
-    The 15 files an earlier run had left in per-track folders must count as
-    done once they have been moved up.
+    Files an earlier run left in per-track folders must count as done once
+    they have been moved up and numbered.
     """
     root = track_runner.tmp_path / 'My_Mix'
     (root / 'Track_0').mkdir(parents=True)
@@ -585,6 +596,7 @@ def test_old_layout_is_picked_up_as_done(track_runner):
     YTPL.process_playlist('My Mix', _entries(2))
 
     assert track_runner.urls == ['u1']        # Track 0 recognised, not redone
+    assert os.path.exists(root / '001-Track_0_0001.mp3')
 
 
 # --- pause and stop keys ---------------------------------------------------
@@ -615,7 +627,7 @@ def test_pause_waits_for_a_second_p(monkeypatch, tmp_path, capsys):
 
     assert YTPL.check_controls() is None
     out = capsys.readouterr().out
-    assert 'paused' in out
+    assert 'PAUSED' in out
     assert 'carrying on' in out
 
 
@@ -748,3 +760,102 @@ def test_a_final_403_explains_itself(track_runner, caplog, monkeypatch):
 
     # Three tracks gave up on a 403; the advice is printed for the first only.
     assert caplog.text.count('pip install yt-dlp-ejs') == 1
+
+
+# --- numbering -------------------------------------------------------------
+
+def test_track_base_name():
+    assert YTPL.track_base_name(1, 'Sun City - Restless Heart') ==         '001-Sun_City_-_Restless_Heart'
+    assert YTPL.track_base_name(426, 'Last One') == '426-Last_One'
+    assert YTPL.track_base_name(7, 'Deep', digits=4) == '0007-Deep'
+
+
+@pytest.mark.parametrize('total, width', [(5, 3), (426, 3), (999, 3),
+                                          (1000, 4), (12000, 5)])
+def test_number_width(total, width):
+    assert YTPL.number_width(total) == width
+
+
+def test_a_single_segment_has_no_segment_number(album_mp3, tmp_path):
+    """
+    '001-Track.mp3', not '001-Track_0001.mp3': the segment number is only
+    meaningful when there is more than one.
+    """
+    path, duration = album_mp3
+    created = YTPL.split_audio(path, [], duration,
+                               base_name='001-Track', output_dir=str(tmp_path))
+
+    assert [os.path.basename(p) for p in created] == ['001-Track.mp3']
+
+
+def test_several_segments_keep_their_numbers(album_mp3, tmp_path):
+    path, duration = album_mp3
+    created = YTPL.split_audio(path, [41.0, 83.0], duration,
+                               base_name='001-Track', output_dir=str(tmp_path))
+
+    assert [os.path.basename(p) for p in created] == ['001-Track_0001.mp3',
+                                                      '001-Track_0002.mp3',
+                                                      '001-Track_0003.mp3']
+
+
+def test_track_files_matches_both_shapes(tmp_path):
+    for name in ('001-Song.mp3', '002-Other_0001.mp3', '002-Other_0002.mp3',
+                 '003-Song_Extended.mp3'):
+        open(tmp_path / name, 'wb').close()
+
+    assert YTPL.track_files(str(tmp_path), '001-Song') == ['001-Song.mp3']
+    assert YTPL.track_files(str(tmp_path), '002-Other') == ['002-Other_0001.mp3',
+                                                            '002-Other_0002.mp3']
+    # A name that merely starts the same must not be claimed.
+    assert YTPL.track_files(str(tmp_path), '003-Song') == []
+
+
+# --- numbering files from earlier runs ------------------------------------
+
+def test_existing_files_are_renumbered(tmp_path):
+    """
+    Files downloaded before the numbering existed get the number they now
+    carry, or a rerun would fetch every one of them again.
+    """
+    root = tmp_path / 'Mix'
+    root.mkdir()
+    open(root / 'Track_0_0001.mp3', 'wb').close()
+    open(root / 'Track_0_0002.mp3', 'wb').close()
+    open(root / 'Track_1.mp3', 'wb').close()
+
+    renamed = YTPL.renumber_existing_tracks(str(root), _entries(2))
+
+    assert renamed == 3
+    assert sorted(os.listdir(root)) == ['001-Track_0_0001.mp3',
+                                        '001-Track_0_0002.mp3',
+                                        '002-Track_1.mp3']
+
+
+def test_renumbering_is_idempotent(tmp_path):
+    root = tmp_path / 'Mix'
+    root.mkdir()
+    open(root / '001-Track_0.mp3', 'wb').close()
+
+    assert YTPL.renumber_existing_tracks(str(root), _entries(1)) == 0
+    assert os.listdir(root) == ['001-Track_0.mp3']
+
+
+def test_renumbering_leaves_unknown_files_alone(tmp_path):
+    root = tmp_path / 'Mix'
+    root.mkdir()
+    open(root / 'Someone_Elses_Song.mp3', 'wb').close()
+
+    YTPL.renumber_existing_tracks(str(root), _entries(2))
+
+    assert os.listdir(root) == ['Someone_Elses_Song.mp3']
+
+
+def test_renumbering_does_not_overwrite(tmp_path):
+    root = tmp_path / 'Mix'
+    root.mkdir()
+    open(root / 'Track_0.mp3', 'wb').close()
+    open(root / '001-Track_0.mp3', 'wb').close()
+
+    YTPL.renumber_existing_tracks(str(root), _entries(1))
+
+    assert sorted(os.listdir(root)) == ['001-Track_0.mp3', 'Track_0.mp3']

@@ -110,6 +110,7 @@ Passing a URL as an argument runs the default mode without any questions.
 | `--overwrite` | re-download playlist tracks that are already on disk |
 | `--attempts 3` | tries per track before it counts as failed |
 | `--max-failures 5` | end the run after this many failures in a row; 0 never gives up |
+| `--min-free 500` | stop rather than leave the disk with less than this many MB; 0 turns the check off |
 | `--log-file PATH` | where to write the log (default `ytpl.log`) |
 | `--no-log-file` | do not write a log file |
 | `-v`, `--verbose` | debug output on the console, and yt-dlp's own |
@@ -156,15 +157,38 @@ playlist:
 
 ```
 Essential_NewRetroWave_Vocal_Jams/
-  Sun_City_-_Restless_Heart_0001.mp3
-  Thought_Beings_-_Sky_High_0001.mp3
-  Thought_Beings_-_Sky_High_0002.mp3
+  001-Sun_City_-_Restless_Heart.mp3
+  002-Thought_Beings_-_Sky_High_0001.mp3
+  002-Thought_Beings_-_Sky_High_0002.mp3
+  003-Subject_Sue_-_Details_in_the_Dark.mp3
 ```
 
+Each file is numbered by the track's place in the playlist, so the folder sorts
+in playlist order in any file manager; the width follows the count, so 426
+tracks are `001` to `426`. The `_0001` on the second track is a segment number,
+and it only appears when a track was actually split.
+
 A track already on disk is skipped, so a stopped run resumes where it left off;
-`--overwrite` downloads it again. (Earlier versions gave every track its own
-subfolder; those files are moved up into the playlist folder on the next run,
-so nothing is downloaded twice.)
+`--overwrite` downloads it again. Files from earlier versions are brought up to
+this layout on the next run - moved out of their per-track subfolders and
+numbered - so nothing is downloaded twice.
+
+### Disk space
+
+Before it starts, the run adds up the durations in the listing and says what
+that will cost against the free space:
+
+```
+426 tracks -> Essential_NewRetroWave_Vocal_Jams/
+About 3.3 GB needed, 113.7 GB free
+```
+
+The rate behind it, 32 KB a second, was measured on real tracks and comes to
+about 109 MB per hour of audio. If the estimate does not fit, the run says so
+and asks before starting. Free space is then checked again before every track,
+and the run stops rather than leave the disk with less than `--min-free` (500
+MB by default) on it - an estimate made at the start cannot know what else
+fills the disk meanwhile.
 
 Each track gets `--attempts` tries, 3 by default. This is not padding: YouTube
 hands out a different player client on each extraction and some of them answer
@@ -346,6 +370,20 @@ an external source while the program works, so it is off by default.
   of putting hundreds of tracks through the same failure
 - **Fixed: ffmpeg's progress meter was printed over the console's own output**
   during the conversion to mp3
+- **Playlist files are numbered** by their place in the playlist
+  (`001-Track.mp3`), and a track that was not split no longer carries a
+  pointless segment number; files from earlier runs are renamed to match
+- **Disk space is estimated** from the listing before the run and checked
+  before every track, so a playlist stops instead of filling the disk
+- **Temp folders left by earlier runs are swept at startup.** Each download
+  cleans up after itself, but a killed run cannot - one had left 134 of them
+- **Fixed: output from ffmpeg was decoded with the system code page**, which
+  raised on a track with a Korean title and killed subprocess's reader thread
+  mid-run. Since silencedetect's findings are parsed out of that output, a
+  track could also have been left unsplit without a word
+- **Fixed: a title the console cannot encode would have ended the whole run**
+  from outside the per-track error handling
+- **A pause is now unmissable** on the console and recorded in the log
 
 - **Silence analysis is now the default; chapters and description are used only
   with `--from-description`**
