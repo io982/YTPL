@@ -1,6 +1,7 @@
 """
 Playlist handling: detecting a list= URL, listing every entry, choosing
-between the whole playlist and the single video, and processing the tracks.
+between the whole playlist and the single video, processing the tracks into one
+folder, and stopping a long run.
 
 The playlist listing is stubbed, so these tests never reach YouTube. The shape
 of the stub matches what yt-dlp really returns for a flat extraction, including
@@ -136,12 +137,14 @@ def spy_process(monkeypatch):
     calls = []
 
     def _single(url, manual_timestamps=None, mode=YTPL.MODE_SILENCE,
-                silence_opts=None, output_root=None, output_name=None):
+                silence_opts=None, output_dir=None, base_name=None):
         calls.append(('single', url))
         return ['one.mp3']
 
     def _playlist(playlist_title, entries, unavailable=0, manual_timestamps=None,
-                  mode=YTPL.MODE_SILENCE, silence_opts=None, overwrite=False):
+                  mode=YTPL.MODE_SILENCE, silence_opts=None, overwrite=False,
+                  max_failures=YTPL.DEFAULT_MAX_FAILURES,
+                  attempts=YTPL.DEFAULT_TRACK_ATTEMPTS):
         calls.append(('playlist', playlist_title, len(entries)))
         return ['many.mp3']
 
@@ -225,6 +228,46 @@ def test_parser_playlist_flags():
     assert parser.parse_args(['--overwrite']).overwrite is True
 
 
+# --- recognising finished tracks ------------------------------------------
+
+def test_track_is_done(tmp_path):
+    open(tmp_path / 'Song_0001.mp3', 'wb').close()
+
+    assert YTPL.track_is_done(str(tmp_path), 'Song') is True
+    assert YTPL.track_is_done(str(tmp_path), 'Other') is False
+
+
+def test_track_is_done_does_not_confuse_a_longer_name(tmp_path):
+    """
+    All tracks share one folder, so matching on a prefix would report 'Song' as
+    finished when only 'Song_Extended' is there.
+    """
+    open(tmp_path / 'Song_Extended_0001.mp3', 'wb').close()
+
+    assert YTPL.track_is_done(str(tmp_path), 'Song_Extended') is True
+    assert YTPL.track_is_done(str(tmp_path), 'Song') is False
+
+
+def test_track_is_done_ignores_other_files(tmp_path):
+    open(tmp_path / 'Song.txt', 'wb').close()
+    open(tmp_path / 'Song_abcd.mp3', 'wb').close()
+
+    assert YTPL.track_is_done(str(tmp_path), 'Song') is False
+
+
+def test_track_is_done_on_a_missing_folder(tmp_path):
+    assert YTPL.track_is_done(str(tmp_path / 'nope'), 'Song') is False
+
+
+def test_remove_track_files(tmp_path):
+    for name in ('Song_0001.mp3', 'Song_0002.mp3', 'Other_0001.mp3', 'Song.txt'):
+        open(tmp_path / name, 'wb').close()
+
+    YTPL.remove_track_files(str(tmp_path), 'Song')
+
+    assert sorted(os.listdir(tmp_path)) == ['Other_0001.mp3', 'Song.txt']
+
+
 # --- processing the tracks -------------------------------------------------
 
 @pytest.fixture
@@ -234,22 +277,27 @@ def track_runner(monkeypatch, tmp_path):
     processing stubbed, and reports which tracks were handled and with what.
     """
     monkeypatch.chdir(tmp_path)
-    seen = types.SimpleNamespace(urls=[], roots=[], modes=[], opts=[], names=[],
-                                 fail=set())
+    # Retries are real seconds in a real run; here they only slow the suite.
+    monkeypatch.setattr(YTPL, 'TRACK_RETRY_WAIT', 0)
+    seen = types.SimpleNamespace(urls=[], dirs=[], names=[], modes=[], opts=[],
+                                 fail=set(), interrupt=set(), attempts=[])
 
     def _single(url, manual_timestamps=None, mode=YTPL.MODE_SILENCE,
-                silence_opts=None, output_root=None, output_name=None):
+                silence_opts=None, output_dir=None, base_name=None):
+        seen.attempts.append(url)
         if url in seen.fail:
             raise RuntimeError('download failed')
         seen.urls.append(url)
-        seen.roots.append(output_root)
+        seen.dirs.append(output_dir)
+        seen.names.append(base_name)
         seen.modes.append(mode)
         seen.opts.append(silence_opts)
-        seen.names.append(output_name)
-        track_dir = os.path.join(output_root, output_name)
-        os.makedirs(track_dir, exist_ok=True)
-        created = os.path.join(track_dir, 'seg_0001.mp3')
+        os.makedirs(output_dir, exist_ok=True)
+        created = os.path.join(output_dir, f'{base_name}_0001.mp3')
         open(created, 'wb').close()
+        if url in seen.interrupt:
+            # Interrupted after writing a segment, as a real run would be.
+            raise KeyboardInterrupt
         return [created]
 
     monkeypatch.setattr(YTPL, 'process_youtube_video', _single)
@@ -268,17 +316,24 @@ def test_playlist_processes_every_track(track_runner):
     assert len(created) == 4
 
 
-def test_playlist_tracks_go_into_the_playlist_folder(track_runner):
-    YTPL.process_playlist('My Mix', _entries(2))
-
-    assert track_runner.roots == ['My_Mix', 'My_Mix']
-    assert (track_runner.tmp_path / 'My_Mix').is_dir()
-
-
-def test_track_folder_name_comes_from_the_playlist_entry(track_runner):
+def test_all_tracks_land_in_one_folder(track_runner):
     """
-    The folder name is decided before the download, so a rerun can tell which
-    tracks are already on disk even if the video reports a different title.
+    One folder for the whole playlist, not a folder per track.
+    """
+    YTPL.process_playlist('My Mix', _entries(3))
+
+    assert track_runner.dirs == ['My_Mix'] * 3
+    folder = track_runner.tmp_path / 'My_Mix'
+    assert sorted(os.listdir(folder)) == ['Track_0_0001.mp3',
+                                          'Track_1_0001.mp3',
+                                          'Track_2_0001.mp3']
+    assert [p for p in folder.iterdir() if p.is_dir()] == []
+
+
+def test_file_names_come_from_the_playlist_entries(track_runner):
+    """
+    The name is decided before the download, so a rerun can tell which tracks
+    are already on disk even if the video reports a different title.
     """
     YTPL.process_playlist('My Mix', _entries(2))
 
@@ -287,8 +342,8 @@ def test_track_folder_name_comes_from_the_playlist_entry(track_runner):
 
 def test_playlist_keeps_the_silence_mode_for_each_track(track_runner):
     """
-    Point 3 of the request: every track of the playlist is still checked for
-    pauses, with the same settings as a single video.
+    Every track of the playlist is still checked for pauses, with the same
+    settings as a single video.
     """
     opts = {'min_segment': 20.0}
     YTPL.process_playlist('My Mix', _entries(3), mode=YTPL.MODE_SILENCE, silence_opts=opts)
@@ -308,20 +363,10 @@ def test_one_failing_track_does_not_stop_the_run(track_runner, capsys):
     assert 'Track 1' in out
 
 
-def test_keyboard_interrupt_stops_the_run(track_runner):
-    def _interrupt(url, *a, **k):
-        raise KeyboardInterrupt
-
-    import YTPL as module
-    module.process_youtube_video = _interrupt
-    with pytest.raises(KeyboardInterrupt):
-        YTPL.process_playlist('My Mix', _entries(2))
-
-
 def test_finished_tracks_are_skipped_on_a_rerun(track_runner):
     """
-    An interrupted playlist run has to resume: tracks whose folder already
-    holds mp3 files are not downloaded again.
+    An interrupted playlist run has to resume: tracks already on disk are not
+    downloaded again.
     """
     entries = _entries(3)
     YTPL.process_playlist('My Mix', entries)
@@ -342,8 +387,364 @@ def test_overwrite_redownloads_finished_tracks(track_runner):
     assert track_runner.urls == ['u0', 'u1']
 
 
-def test_unavailable_count_is_reported(track_runner, capsys):
+def test_unavailable_count_is_reported(track_runner, caplog):
     YTPL.process_playlist('My Mix', _entries(2), unavailable=3)
 
-    assert 'Skipped unavailable entries: 3' in capsys.readouterr().err or True
+    assert 'Skipped unavailable entries: 3' in caplog.text
     assert track_runner.urls == ['u0', 'u1']
+
+
+# --- stopping a long run ---------------------------------------------------
+
+def test_ctrl_c_stops_the_run_without_a_traceback(track_runner, capsys):
+    """
+    Ctrl+C part way through a playlist ends the run tidily, with a summary and
+    how to carry on, rather than a traceback.
+    """
+    track_runner.interrupt = {'u1'}
+    created = YTPL.process_playlist('My Mix', _entries(4))
+
+    assert track_runner.urls == ['u0', 'u1']      # stopped, u2/u3 untouched
+    assert len(created) == 1                       # only the finished track
+    out = capsys.readouterr().out
+    assert 'Playlist stopped' in out
+    assert 'Stopped at track 2 of 4' in out
+    assert 'Run the same command again' in out
+
+
+def test_interrupted_track_is_rolled_back(track_runner):
+    """
+    The track in progress is incomplete, so its files are removed: otherwise
+    the next run would treat it as finished and skip it.
+    """
+    track_runner.interrupt = {'u1'}
+    YTPL.process_playlist('My Mix', _entries(4))
+
+    folder = track_runner.tmp_path / 'My_Mix'
+    assert os.listdir(folder) == ['Track_0_0001.mp3']
+
+
+def test_rerun_after_ctrl_c_carries_on(track_runner):
+    entries = _entries(4)
+    track_runner.interrupt = {'u1'}
+    YTPL.process_playlist('My Mix', entries)
+
+    track_runner.interrupt = set()
+    track_runner.urls.clear()
+    YTPL.process_playlist('My Mix', entries)
+
+    # Track 0 was finished, so it is skipped; the rest are picked up.
+    assert track_runner.urls == ['u1', 'u2', 'u3']
+
+
+def test_stop_file_stops_the_run(track_runner, capsys):
+    """
+    A file named STOP halts the run at the next track boundary, for when the
+    console cannot be reached to press Ctrl+C.
+    """
+    open(track_runner.tmp_path / YTPL.STOP_FILE, 'wb').close()
+
+    created = YTPL.process_playlist('My Mix', _entries(3))
+
+    assert track_runner.urls == []
+    assert created == []
+    out = capsys.readouterr().out
+    assert 'Playlist stopped' in out
+    assert 'Stopped at track 1 of 3' in out
+
+
+def test_stop_file_is_noticed_between_tracks(track_runner):
+    """
+    The file is checked before each track, so one created while a track is
+    downloading takes effect as soon as that track is finished.
+    """
+    entries = _entries(4)
+    original = YTPL.process_youtube_video
+
+    def _single(url, *args, **kwargs):
+        result = original(url, *args, **kwargs)
+        if url == 'u0':
+            open(track_runner.tmp_path / YTPL.STOP_FILE, 'wb').close()
+        return result
+
+    YTPL.process_youtube_video = _single
+    try:
+        YTPL.process_playlist('My Mix', entries)
+    finally:
+        YTPL.process_youtube_video = original
+
+    assert track_runner.urls == ['u0']
+
+
+def test_stop_requested_checks_the_working_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert YTPL.stop_requested() is False
+
+    open(tmp_path / YTPL.STOP_FILE, 'wb').close()
+    assert YTPL.stop_requested() is True
+
+# --- the failure ceiling ---------------------------------------------------
+
+def test_run_gives_up_after_failures_in_a_row(track_runner, capsys):
+    """
+    Once downloads stop working they stay broken, so a run must not put
+    several hundred tracks through the same failure.
+    """
+    entries = _entries(20)
+    track_runner.fail = {f'u{i}' for i in range(20)}
+
+    YTPL.process_playlist('My Mix', entries, max_failures=3)
+
+    assert track_runner.urls == []
+    out = capsys.readouterr().out
+    assert '3 failures in a row' in out
+    assert 'Stopped at track 3 of 20' in out
+
+
+def test_a_success_resets_the_failure_count(track_runner):
+    entries = _entries(8)
+    track_runner.fail = {'u0', 'u1', 'u3', 'u4'}
+
+    YTPL.process_playlist('My Mix', entries, max_failures=3)
+
+    # Two failures, then u2 succeeds and resets, so the run reaches the end.
+    assert track_runner.urls == ['u2', 'u5', 'u6', 'u7']
+
+
+def test_max_failures_zero_never_gives_up(track_runner, capsys):
+    entries = _entries(6)
+    track_runner.fail = {f'u{i}' for i in range(6)}
+
+    YTPL.process_playlist('My Mix', entries, max_failures=0)
+
+    out = capsys.readouterr().out
+    assert 'Failed tracks: 6' in out          # every track was attempted
+    assert 'Stopped at track' not in out
+
+
+def test_parser_max_failures():
+    assert YTPL.build_parser().parse_args([]).max_failures == YTPL.DEFAULT_MAX_FAILURES
+    assert YTPL.build_parser().parse_args(['--max-failures', '0']).max_failures == 0
+
+
+# --- migrating the old per-track folders ----------------------------------
+
+def test_existing_per_track_folders_are_flattened(tmp_path):
+    """
+    Earlier versions wrote a folder per track. The files move up, or a rerun
+    would not recognise them and would download everything again.
+    """
+    root = tmp_path / 'Mix'
+    (root / 'Track_0').mkdir(parents=True)
+    (root / 'Track_1').mkdir()
+    open(root / 'Track_0' / 'Track_0_0001.mp3', 'wb').close()
+    open(root / 'Track_0' / 'Track_0_0002.mp3', 'wb').close()
+    open(root / 'Track_1' / 'Track_1_0001.mp3', 'wb').close()
+
+    moved = YTPL.flatten_playlist_folder(str(root))
+
+    assert moved == 3
+    assert sorted(os.listdir(root)) == ['Track_0_0001.mp3', 'Track_0_0002.mp3',
+                                        'Track_1_0001.mp3']
+
+
+def test_flattening_leaves_other_files_alone(tmp_path):
+    root = tmp_path / 'Mix'
+    (root / 'Track_0').mkdir(parents=True)
+    open(root / 'Track_0' / 'cover.jpg', 'wb').close()
+    open(root / 'Track_0' / 'Track_0_0001.mp3', 'wb').close()
+
+    YTPL.flatten_playlist_folder(str(root))
+
+    # The mp3 moved up; the subfolder stays because something is still in it.
+    assert 'Track_0_0001.mp3' in os.listdir(root)
+    assert os.listdir(root / 'Track_0') == ['cover.jpg']
+
+
+def test_flattening_does_not_overwrite(tmp_path):
+    root = tmp_path / 'Mix'
+    (root / 'Track_0').mkdir(parents=True)
+    open(root / 'Track_0_0001.mp3', 'wb').close()
+    open(root / 'Track_0' / 'Track_0_0001.mp3', 'wb').close()
+
+    moved = YTPL.flatten_playlist_folder(str(root))
+
+    assert moved == 0
+    assert os.path.exists(root / 'Track_0' / 'Track_0_0001.mp3')
+
+
+def test_old_layout_is_picked_up_as_done(track_runner):
+    """
+    The 15 files an earlier run had left in per-track folders must count as
+    done once they have been moved up.
+    """
+    root = track_runner.tmp_path / 'My_Mix'
+    (root / 'Track_0').mkdir(parents=True)
+    open(root / 'Track_0' / 'Track_0_0001.mp3', 'wb').close()
+
+    YTPL.process_playlist('My Mix', _entries(2))
+
+    assert track_runner.urls == ['u1']        # Track 0 recognised, not redone
+
+
+# --- pause and stop keys ---------------------------------------------------
+
+@pytest.mark.parametrize('key', ['s', 'q'])
+def test_stop_keys(monkeypatch, tmp_path, key):
+    """
+    's' and 'q' both stop: 'q' for quit is what one reaches for.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(YTPL, '_read_key', lambda: key)
+
+    assert YTPL.check_controls() == 'stop'
+
+
+def test_no_key_carries_on(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(YTPL, '_read_key', lambda: None)
+
+    assert YTPL.check_controls() is None
+
+
+def test_pause_waits_for_a_second_p(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    keys = iter(['p', None, None, 'p'])
+    monkeypatch.setattr(YTPL, '_read_key', lambda: next(keys, None))
+    monkeypatch.setattr(YTPL.time, 'sleep', lambda s: None)
+
+    assert YTPL.check_controls() is None
+    out = capsys.readouterr().out
+    assert 'paused' in out
+    assert 'carrying on' in out
+
+
+def test_pause_can_be_stopped(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    keys = iter(['p', None, 's'])
+    monkeypatch.setattr(YTPL, '_read_key', lambda: next(keys, None))
+    monkeypatch.setattr(YTPL.time, 'sleep', lambda s: None)
+
+    assert YTPL.check_controls() == 'stop'
+
+
+def test_read_key_is_safe_without_a_console():
+    """
+    Output redirected to a file, or a platform without msvcrt: it must return
+    quietly rather than raise, and never hand back anything but one character.
+    """
+    key = YTPL._read_key()
+
+    assert key is None or (isinstance(key, str) and len(key) == 1)
+
+
+# --- the quiet console ----------------------------------------------------
+
+def test_console_shows_one_line_per_track(track_runner, capsys):
+    YTPL.process_playlist('My Mix', _entries(2))
+    out = capsys.readouterr().out
+
+    assert 'Track 0 -> 1 file' in out
+    assert 'Track 1 -> 1 file' in out
+    assert 'Keys: [p] pause' in out
+    assert '2 tracks -> My_Mix/' in out
+
+
+def test_console_shows_the_failure_reason(track_runner, capsys):
+    track_runner.fail = {'u0'}
+    YTPL.process_playlist('My Mix', _entries(2))
+
+    assert 'FAILED: download failed' in capsys.readouterr().out
+
+
+# --- retrying a track ------------------------------------------------------
+
+def test_a_track_is_retried_before_being_given_up_on(track_runner):
+    """
+    YouTube hands out a different player client each extraction and some of
+    them answer 403, so the same track is worth another go.
+    """
+    track_runner.fail = {'u0'}
+
+    YTPL.process_playlist('My Mix', _entries(1), attempts=3)
+
+    assert track_runner.attempts == ['u0', 'u0', 'u0']
+
+
+def test_a_retry_that_works_counts_as_a_success(track_runner, capsys):
+    entries = _entries(1)
+    calls = {'n': 0}
+    original = YTPL.process_youtube_video
+
+    def _flaky(url, *args, **kwargs):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise RuntimeError('403 on the first client')
+        return original(url, *args, **kwargs)
+
+    YTPL.process_youtube_video = _flaky
+    try:
+        created = YTPL.process_playlist('My Mix', entries, attempts=3)
+    finally:
+        YTPL.process_youtube_video = original
+
+    assert len(created) == 1
+    out = capsys.readouterr().out
+    assert 'Track 0 -> 1 file' in out
+    assert 'FAILED' not in out
+
+
+def test_a_failed_attempt_leaves_nothing_behind(track_runner):
+    """
+    Half a track on disk would be taken for a finished one by the next run.
+    """
+    entries = _entries(1)
+    original = YTPL.process_youtube_video
+
+    def _writes_then_fails(url, *args, **kwargs):
+        original(url, *args, **kwargs)        # writes the segment
+        raise RuntimeError('died after writing')
+
+    YTPL.process_youtube_video = _writes_then_fails
+    try:
+        YTPL.process_playlist('My Mix', entries, attempts=2)
+    finally:
+        YTPL.process_youtube_video = original
+
+    assert os.listdir(track_runner.tmp_path / 'My_Mix') == []
+
+
+def test_parser_attempts():
+    assert YTPL.build_parser().parse_args([]).attempts == YTPL.DEFAULT_TRACK_ATTEMPTS
+    assert YTPL.build_parser().parse_args(['--attempts', '1']).attempts == 1
+
+
+def test_the_403_hint_is_said_once_per_run(track_runner, caplog, monkeypatch):
+    """
+    A 403 a retry gets past needs no advice, and four hundred of them need it
+    once: it is said when a track is given up on, and then not again.
+    """
+    monkeypatch.setattr(YTPL, '_403_hint_shown', False)
+    track_runner.fail = {'u0', 'u1'}
+
+    YTPL.process_playlist('My Mix', _entries(2), attempts=1,
+                          max_failures=0)
+
+    assert caplog.text.count('pip install yt-dlp-ejs') == 0   # not a 403 here
+
+
+def test_a_final_403_explains_itself(track_runner, caplog, monkeypatch):
+    monkeypatch.setattr(YTPL, '_403_hint_shown', False)
+    original = YTPL.process_youtube_video
+
+    def _forbidden(url, *args, **kwargs):
+        raise RuntimeError('HTTP Error 403: Forbidden')
+
+    YTPL.process_youtube_video = _forbidden
+    try:
+        YTPL.process_playlist('My Mix', _entries(3), attempts=1, max_failures=0)
+    finally:
+        YTPL.process_youtube_video = original
+
+    # Three tracks gave up on a 403; the advice is printed for the first only.
+    assert caplog.text.count('pip install yt-dlp-ejs') == 1

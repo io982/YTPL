@@ -106,6 +106,8 @@ Passing a URL as an argument runs the default mode without any questions.
 | `--playlist` | for a `list=` URL, take every track without asking |
 | `--no-playlist` | for a `list=` URL, take only the video it points at |
 | `--overwrite` | re-download playlist tracks that are already on disk |
+| `--attempts 3` | tries per track before it counts as failed |
+| `--max-failures 5` | end the run after this many failures in a row; 0 never gives up |
 | `--log-file PATH` | where to write the log (default `ytpl.log`) |
 | `--no-log-file` | do not write a log file |
 | `-v`, `--verbose` | debug output on the console, and yt-dlp's own |
@@ -147,21 +149,65 @@ that fast. Deleted and private entries come back without a title; they are
 counted and skipped.
 
 Each track is then processed exactly like a single video, so the pauses inside
-it are analysed the same way. The layout is one folder per track inside the
-playlist folder:
+it are analysed the same way. Everything lands in one folder named after the
+playlist:
 
 ```
 Essential_NewRetroWave_Vocal_Jams/
-  Sun_City_-_Restless_Heart/
-    Sun_City_-_Restless_Heart_0001.mp3
-  Thought_Beings_-_Sky_High/
-    Thought_Beings_-_Sky_High_0001.mp3
+  Sun_City_-_Restless_Heart_0001.mp3
+  Thought_Beings_-_Sky_High_0001.mp3
+  Thought_Beings_-_Sky_High_0002.mp3
 ```
 
-A track whose folder already holds mp3 files is skipped, so an interrupted run
-resumes where it stopped; `--overwrite` downloads them again. A track that
-fails does not stop the run - the error is logged and the summary at the end
-lists every failure.
+A track already on disk is skipped, so a stopped run resumes where it left off;
+`--overwrite` downloads it again. (Earlier versions gave every track its own
+subfolder; those files are moved up into the playlist folder on the next run,
+so nothing is downloaded twice.)
+
+Each track gets `--attempts` tries, 3 by default. This is not padding: YouTube
+hands out a different player client on each extraction and some of them answer
+403 on the media URL, so the second go at the very same track usually just
+works. A track that fails every attempt does not stop the run - but
+`--max-failures` in a row does, because downloads that stop working stay
+broken, and there is nothing to be gained from putting another 400 tracks
+through the same failure.
+
+### While it runs
+
+The console keeps one status line plus a line per finished track, and the
+detail goes to the log file:
+
+```
+Playlist: Essential NewRetroWave Vocal Jams
+426 tracks -> Essential_NewRetroWave_Vocal_Jams/
+Keys: [p] pause   [s] stop after this track   [Ctrl+C] stop now
+
+[1/426] Sun City - Restless Heart -> 1 file
+[2/426] Thought Beings - Sky High -> 2 files
+[3/426] 423 left | Subject Sue - Details in the Dark
+```
+
+| Key | Effect |
+| --- | --- |
+| `p` | pause after the current track, `p` again to carry on |
+| `s` or `q` | stop after the current track |
+| `Ctrl+C` | stop now; the track in progress is rolled back |
+
+Keys pressed during a download take effect when that track finishes, which is
+the point: stopping half way through would leave a part-written track behind.
+A file named `STOP` next to the program does the same as `s`, for when the
+console cannot be reached. Either way the summary says where it stopped, and
+running the same command again carries on from there.
+
+### One file per track
+
+A track with a long enough pause inside it is split, which is usually what you
+want for a mix but not always for a song. To keep every track whole, set a
+minimum segment longer than any track:
+
+```bash
+python YTPL.py "<url>" --playlist --min-segment 600
+```
 
 ## Logging
 
@@ -285,6 +331,19 @@ an external source while the program works, so it is off by default.
   had left 134 of them behind
 - **`requirements.txt` / `requirements-dev.txt`** instead of a pip line in the
   README
+- **One folder per playlist**, not per track; files from the old layout are
+  moved up on the next run so nothing is downloaded twice
+- **A quiet console**: a status line with the total, what is left and the
+  current track, a line per finished track, and everything else in the log
+- **Pause and stop**: `p`, `s`/`q`, `Ctrl+C` or a `STOP` file, all at a track
+  boundary, with the track in progress rolled back and the summary saying
+  where to carry on from
+- **Each track is retried** (`--attempts`), because YouTube answers 403 on
+  some of its own player clients and the next try lands on a working one
+- **A run that has stopped working now gives up** (`--max-failures`) instead
+  of putting hundreds of tracks through the same failure
+- **Fixed: ffmpeg's progress meter was printed over the console's own output**
+  during the conversion to mp3
 
 - **Silence analysis is now the default; chapters and description are used only
   with `--from-description`**

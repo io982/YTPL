@@ -58,6 +58,26 @@ _ytdlp_verbose = False
 # Remote components yt-dlp may fetch; set from --remote-components.
 _remote_components = []
 
+# A file by this name asks a playlist run to stop at the next track boundary.
+STOP_FILE = 'STOP'
+
+# Consecutive track failures that end a playlist run. Downloads that stop
+# working stay broken - an expired token, a dead network, a console window
+# closed from under the subprocesses - and grinding through several hundred
+# tracks to fail each one helps nobody.
+DEFAULT_MAX_FAILURES = 5
+
+# Attempts per track. YouTube hands out a different player client each
+# extraction, and some of them answer 403 on the media URL, so a second go
+# at the same track often just works.
+DEFAULT_TRACK_ATTEMPTS = 3
+
+# Seconds between those attempts.
+TRACK_RETRY_WAIT = 3
+
+# The 403 hint is worth saying once a run, not once a track.
+_403_hint_shown = False
+
 # Cached result of node_is_usable(), so the probe runs once per process.
 _node_checked = None
 
@@ -168,10 +188,11 @@ def setup_logging(log_file=DEFAULT_LOG_FILE, verbose=False):
     """
     Console logging plus a full-detail log file.
 
-    The console stays readable (INFO, or DEBUG with verbose) while the file
-    always records DEBUG. That is deliberate: when a download fails, what tells
-    a YouTube-side block apart from a local problem is yt-dlp's own output and
-    the environment banner, and both are too noisy for the console.
+    The console is left with warnings and errors only (everything, with
+    verbose) while the file always records DEBUG. That is deliberate: progress
+    is shown by the status line, and what tells a YouTube-side block apart from
+    a local problem - yt-dlp's own output, the environment banner, tracebacks -
+    is far too noisy to put in front of someone watching a playlist download.
 
     Returns the path of the log file, or None when no file is written.
     """
@@ -181,7 +202,9 @@ def setup_logging(log_file=DEFAULT_LOG_FILE, verbose=False):
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
     for handler in root.handlers:
-        handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+        # The console carries the progress line and the per-track results; the
+        # running commentary would only bury them, so it goes to the file.
+        handler.setLevel(logging.DEBUG if verbose else logging.WARNING)
 
     if not log_file:
         return None
@@ -201,6 +224,22 @@ def setup_logging(log_file=DEFAULT_LOG_FILE, verbose=False):
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
     root.addHandler(file_handler)
     return log_file
+
+
+def warn_403_once(error):
+    """
+    Say the 403 hint on the console the first time a track is given up on for
+    one, and only then: a 403 that a retry gets past needs no advice, and 400
+    of them need it once.
+    """
+    global _403_hint_shown
+    if '403' not in str(error):
+        return
+    if _403_hint_shown:
+        logger.debug(HTTP_403_HINT)
+        return
+    logger.error(HTTP_403_HINT)
+    _403_hint_shown = True
 
 
 def node_is_usable(timeout=NODE_PROBE_TIMEOUT):
@@ -277,8 +316,12 @@ def log_environment():
 class _YtdlpLogger:
     """
     Routes yt-dlp's own messages into the logging module, so they reach the log
-    file as well. This is where a '403 Forbidden', a missing JavaScript runtime
-    or a format-selection problem actually shows up.
+    file. This is where a '403 Forbidden', a missing JavaScript runtime or a
+    format-selection problem actually shows up.
+
+    None of it reaches the console on its own: YTPL reports the outcome of each
+    track itself, and yt-dlp's running commentary would bury it. Everything is
+    in the log file, and verbose puts it back on screen.
     """
     def debug(self, msg):
         # yt-dlp sends ordinary screen output here too; only the lines it marks
@@ -292,10 +335,11 @@ class _YtdlpLogger:
         logger.info(msg)
 
     def warning(self, msg):
-        logger.warning(msg)
+        logger.info(f"[yt-dlp warning] {msg}")
 
     def error(self, msg):
-        logger.error(msg)
+        # YTPL logs the failure itself, with the same text, right after.
+        logger.info(f"[yt-dlp error] {msg}")
 
 
 def _download_progress(status):
@@ -557,11 +601,14 @@ def download_audio(url, verbose=None, remote_components=None):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except Exception as e:
-        # One line on the console, the whole traceback in the log file.
-        logger.error(f"Download failed for {url}: {e}")
+        # Logged, not printed: this may be one attempt of several, and the
+        # caller reports what became of the track.
+        logger.info(f"Download failed for {url}: {e}")
         logger.debug("Download traceback", exc_info=True)
-        if '403' in str(e):
-            logger.error(HTTP_403_HINT)
+        # The runtime may be what broke (a closed console window takes the
+        # subprocesses with it), so probe it again rather than trusting the
+        # earlier answer for the rest of the run.
+        _node_checked = None
         # The caller never received the path, so it cannot clean this up.
         shutil.rmtree(temp_dir_path, ignore_errors=True)
         raise
@@ -592,7 +639,13 @@ def download_audio(url, verbose=None, remote_components=None):
         logger.debug(f"Converting {ext} to mp3")
         mp3_file = os.path.join(temp_dir_path, 'audio.mp3')
         cmd = [ffmpeg_path, '-i', downloaded_file, '-q:a', '0', '-y', mp3_file]
-        subprocess.run(cmd, check=True)
+        # Captured, or ffmpeg's progress meter lands on top of the console's
+        # own status line.
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.debug(f"ffmpeg said:{chr(10)}{result.stderr}")
+            raise RuntimeError(f"ffmpeg could not convert {ext} to mp3 "
+                               f"(exit code {result.returncode})")
         if os.path.exists(downloaded_file):
             os.remove(downloaded_file)
 
@@ -661,7 +714,7 @@ def split_audio(audio_path, timestamps, duration, base_name='video', output_dir=
     return created_files
 
 def process_youtube_video(url, manual_timestamps=None, mode=MODE_SILENCE,
-                          silence_opts=None, output_root=None, output_name=None):
+                          silence_opts=None, output_dir=None, base_name=None):
     """
     Main function to process YouTube video.
 
@@ -669,11 +722,14 @@ def process_youtube_video(url, manual_timestamps=None, mode=MODE_SILENCE,
         manual_timestamps - a string like '145,325'; when given, the mode is always MODE_MANUAL.
         mode              - MODE_SILENCE (the default), MODE_META or MODE_MANUAL.
         silence_opts      - dict of detect_silence_timestamps parameters.
-        output_root       - parent folder for the output (used for playlists).
-        output_name       - folder and file name to use instead of one derived
-                            from the video title. A playlist passes it so the
-                            folder is known before the download and finished
-                            tracks can be recognised on a rerun.
+        output_dir        - folder to write the segments into. The default is
+                            a folder named after the video, next to the script;
+                            a playlist passes its own folder so that all of its
+                            tracks end up together in one place.
+        base_name         - file name stem to use instead of one derived from
+                            the video title. A playlist passes it so the names
+                            are known before the download and finished tracks
+                            can be recognised on a rerun.
 
     Returns list of created segment paths.
     """
@@ -683,8 +739,8 @@ def process_youtube_video(url, manual_timestamps=None, mode=MODE_SILENCE,
         # Download audio (title, description and duration come with the file)
         logger.info("Downloading audio...")
         audio_path, title, description, duration, chapters, temp_dir_path = download_audio(url)
-        print(f"Video title: {title}")
-        print(f"Video duration: {duration}s")
+        logger.info(f"Video title: {title}")
+        logger.info(f"Video duration: {duration}s")
 
         # The source of cut points is decided by the mode, not by whether the
         # author supplied timestamps: chapters and description are NOT given
@@ -714,25 +770,22 @@ def process_youtube_video(url, manual_timestamps=None, mode=MODE_SILENCE,
             # Normal for a single song: nothing to split, so keep it whole.
             logger.info("No cut points found - keeping the audio as a single file.")
 
-        # Split audio
-        base_name = output_name or sanitize_name(title)
-        output_dir = os.path.join(output_root, base_name) if output_root else base_name
+        # Split audio. On its own a video gets a folder of its own; as part of
+        # a playlist it is written straight into the playlist's folder, so the
+        # whole playlist stays together instead of becoming hundreds of folders.
+        base_name = base_name or sanitize_name(title)
+        output_dir = output_dir or base_name
         os.makedirs(output_dir, exist_ok=True)
 
         logger.info("Splitting audio into segments...")
         created_segments = split_audio(audio_path, timestamps, duration, base_name, output_dir)
 
-        print(f"\n{'='*50}")
-        print(f"Processing finished successfully!")
-        print(f"Segments created: {len(created_segments)}")
-        print(f"Output folder: {output_dir}/")
-        print(f"{'='*50}")
-
         logger.info(f"Done: {len(created_segments)} segments in {output_dir}/")
         return created_segments
 
     except Exception as e:
-        logger.error(f"Error: {e}")
+        # The caller turns this into the one line the console gets.
+        logger.info(f"Error: {e}")
         raise
     finally:
         # Clean up the temporary files
@@ -809,32 +862,196 @@ def prompt_playlist(playlist_title, count):
     return input("Choice: ").strip().lower() not in ('o', 'one', 'single', 'n', 'no')
 
 
-def _has_mp3(directory):
+def track_is_done(directory, base_name):
     """
-    Whether the folder already holds at least one mp3. Used to resume a run:
-    on a long playlist a dropped connection should not mean starting over.
+    Whether this track's segments are already in the folder, so a rerun can
+    skip it: on a long playlist a dropped connection should not mean starting
+    over. Every track of a playlist shares one folder, so the match is on the
+    track's own '<base_name>_0001.mp3' names and nothing else.
     """
+    pattern = re.compile(re.escape(base_name) + r'_\d{4}\.mp3$', re.IGNORECASE)
     try:
-        return any(f.lower().endswith('.mp3') for f in os.listdir(directory))
+        return any(pattern.match(f) for f in os.listdir(directory))
     except OSError:
         return False
 
 
+def remove_track_files(directory, base_name):
+    """
+    Delete a track's segments. Used when a run is interrupted part way through
+    a track: what is on disk is incomplete, and leaving it would make the next
+    run treat the track as finished.
+    """
+    pattern = re.compile(re.escape(base_name) + r'_\d{4}\.mp3$', re.IGNORECASE)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if pattern.match(name):
+            try:
+                os.remove(os.path.join(directory, name))
+                logger.debug(f"Removed incomplete segment {name}")
+            except OSError as e:
+                logger.warning(f"Could not remove {name}: {e}")
+
+
+def flatten_playlist_folder(root):
+    """
+    Move segments out of per-track subfolders into the playlist folder.
+
+    Earlier versions gave every track its own subfolder. The files are named
+    after the track either way, so they can simply be moved up - and they have
+    to be, or a rerun would not recognise them and would download them again.
+    """
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+
+    moved = 0
+    for name in names:
+        sub = os.path.join(root, name)
+        if not os.path.isdir(sub):
+            continue
+        for f in os.listdir(sub):
+            if not f.lower().endswith('.mp3'):
+                continue
+            target = os.path.join(root, f)
+            if os.path.exists(target):
+                continue  # already up here; leave both alone
+            try:
+                os.replace(os.path.join(sub, f), target)
+                moved += 1
+                logger.debug(f"Moved {f} out of {name}/")
+            except OSError as e:
+                logger.warning(f"Could not move {f} out of {name}/: {e}")
+        try:
+            os.rmdir(sub)  # only succeeds once it is empty
+        except OSError:
+            pass
+
+    if moved:
+        logger.info(f"Moved {moved} file(s) out of per-track subfolders into {root}/")
+    return moved
+
+
+def _read_key():
+    """
+    Read one keypress if any is waiting, without blocking. Returns the key in
+    lower case, or None.
+
+    Windows only, through msvcrt; everywhere else, and when the console cannot
+    be read (output redirected to a file, for instance), the STOP file is the
+    way to stop a run.
+    """
+    try:
+        import msvcrt
+    except ImportError:
+        return None
+    try:
+        if not msvcrt.kbhit():
+            return None
+        return msvcrt.getwch().lower()
+    except Exception:
+        return None
+
+
+def stop_requested(directory='.'):
+    """
+    Whether a file named STOP has appeared, which asks a playlist run to stop
+    at the next track boundary.
+
+    Keys are the direct way, but they need a console that can be reached and
+    read, which is not a given for a run of several hundred tracks started
+    hours earlier. Creating a file works from anywhere.
+    """
+    return os.path.exists(os.path.join(directory, STOP_FILE))
+
+
+def check_controls(directory='.'):
+    """
+    Look for a pause or stop request between tracks. Returns 'stop' to end the
+    run, or None to carry on; while paused it waits here.
+
+    Keys pressed during a download are buffered by the console, so they take
+    effect as soon as the track in progress is finished - which is the point:
+    stopping half way through a track would leave a part-written one behind.
+    """
+    key = _read_key()
+
+    if key in ('s', 'q') or stop_requested(directory):
+        return 'stop'
+
+    if key == 'p':
+        _line("  paused - press [p] to carry on, [s] to stop")
+        while True:
+            key = _read_key()
+            if key == 'p':
+                _line("  carrying on")
+                return None
+            if key in ('s', 'q') or stop_requested(directory):
+                return 'stop'
+            time.sleep(0.2)
+
+    return None
+
+
+def _console_width():
+    try:
+        return shutil.get_terminal_size().columns
+    except Exception:
+        return 80
+
+
+def _status(text):
+    """
+    Write the self-overwriting status line, so progress does not scroll a line
+    per update.
+    """
+    width = max(_console_width() - 1, 20)
+    print('\r' + text[:width].ljust(width), end='', flush=True)
+
+
+def _line(text):
+    """
+    Finish the status line and leave text in its place.
+    """
+    width = max(_console_width() - 1, 20)
+    print('\r' + text[:width].ljust(width))
+
+
 def process_playlist(playlist_title, entries, unavailable=0, manual_timestamps=None,
-                     mode=MODE_SILENCE, silence_opts=None, overwrite=False):
+                     mode=MODE_SILENCE, silence_opts=None, overwrite=False,
+                     max_failures=DEFAULT_MAX_FAILURES,
+                     attempts=DEFAULT_TRACK_ATTEMPTS):
     """
     Process every video of a playlist. Each track goes through the same
     pipeline as a single video, so its pauses are analysed the same way, and
-    every track gets its own folder inside the playlist folder.
+    all the tracks are written into one folder named after the playlist.
 
-    A failing track does not stop the run: the error is logged and the summary
-    at the end lists what failed. Tracks whose folder already holds mp3 files
-    are skipped unless overwrite is set.
+    The console keeps one status line and one line per finished track; the
+    details go to the log file.
+
+    A track is tried attempts times before being counted as failed: YouTube
+    picks a different player client each extraction and some of them answer 403
+    on the media URL, so a second go at the same track often just works.
+
+    A failing track does not stop the run, but max_failures in a row does:
+    once the downloads stop working - an expired YouTube token, a dead network,
+    a console window closed from under the subprocesses - there is nothing to
+    be gained from putting several hundred tracks through the same failure.
+
+    Tracks already on disk are skipped unless overwrite is set, so a stopped
+    run resumes where it left off. It can be stopped at a track boundary with
+    [s], [q] or a file named STOP, paused with [p], or ended at once with
+    Ctrl+C; the track in progress is then rolled back so a rerun redoes it.
 
     Returns list of created segment paths.
     """
     root = sanitize_name(playlist_title or 'playlist')
     os.makedirs(root, exist_ok=True)
+    flatten_playlist_folder(root)
 
     total = len(entries)
     logger.info(f"Playlist: {playlist_title} - {total} tracks, output folder {root}/")
@@ -843,57 +1060,138 @@ def process_playlist(playlist_title, entries, unavailable=0, manual_timestamps=N
     if manual_timestamps:
         logger.warning("Manual timestamps are applied to every track of the playlist")
 
+    print(f"Playlist: {playlist_title}")
+    print(f"{total} tracks -> {root}/")
+    if unavailable:
+        print(f"({unavailable} unavailable entries skipped)")
+    print("Keys: [p] pause   [s] stop after this track   [Ctrl+C] stop now")
+    print(f"      (or create the file {STOP_FILE} in {os.path.abspath('.')})")
+    print()
+
     created = []
     failed = []
     skipped = 0
+    stopped_at = None
+    stop_reason = None
+    in_a_row = 0
 
     for i, entry in enumerate(entries, 1):
-        # The folder name is fixed here, not derived from the title fetched at
-        # download time: the two can differ, and then a rerun would re-download
-        # a track that is already on disk.
+        # The file name is fixed here rather than taken from the title fetched
+        # at download time: the two can differ, and then a rerun would
+        # re-download a track that is already on disk.
         track_name = sanitize_name(entry['title'])
-        track_dir = os.path.join(root, track_name)
-        if not overwrite and _has_mp3(track_dir):
+        left = total - i
+
+        if check_controls() == 'stop':
+            stopped_at, stop_reason = i, 'asked to stop'
+            break
+
+        if not overwrite and track_is_done(root, track_name):
             skipped += 1
             logger.info(f"[{i}/{total}] already done, skipping: {entry['title']}")
             continue
 
         logger.info(f"[{i}/{total}] {entry['title']}")
-        try:
-            created += process_youtube_video(entry['url'], manual_timestamps, mode,
-                                             silence_opts, output_root=root,
-                                             output_name=track_name)
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            logger.error(f"[{i}/{total}] failed on {entry['title']}: {e}")
-            logger.debug(f"Failed track URL: {entry['url']}", exc_info=True)
+        last_error = None
+
+        for attempt in range(1, max(attempts, 1) + 1):
+            suffix = f" (attempt {attempt}/{attempts})" if attempt > 1 else ""
+            _status(f"[{i}/{total}] {left} left | {entry['title']}{suffix}")
+            try:
+                files = process_youtube_video(entry['url'], manual_timestamps, mode,
+                                              silence_opts, output_dir=root,
+                                              base_name=track_name)
+            except KeyboardInterrupt:
+                logger.warning(f"Interrupted during {entry['title']} - removing its "
+                               "partial files so a rerun redoes it")
+                remove_track_files(root, track_name)
+                stopped_at, stop_reason = i, 'Ctrl+C'
+                _line(f"[{i}/{total}] {entry['title']} - interrupted, rolled back")
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                logger.info(f"[{i}/{total}] attempt {attempt}/{attempts} failed "
+                            f"on {entry['title']}: {e}")
+                logger.debug(f"Failed track URL: {entry['url']}", exc_info=True)
+                # A part-written track would be taken for a finished one.
+                remove_track_files(root, track_name)
+                if attempt < attempts:
+                    time.sleep(TRACK_RETRY_WAIT)
+                continue
+
+            created += files
+            in_a_row = 0
+            last_error = None
+            _line(f"[{i}/{total}] {entry['title']} -> "
+                  f"{len(files)} file{'s' if len(files) != 1 else ''}")
+            break
+
+        if stopped_at:
+            break
+
+        if last_error is not None:
+            logger.error(f"[{i}/{total}] gave up on {entry['title']} after "
+                         f"{attempts} attempt(s): {last_error}")
+            warn_403_once(last_error)
             failed.append(entry['title'])
+            in_a_row += 1
+            _line(f"[{i}/{total}] {entry['title']} - FAILED: {last_error}")
+            if max_failures and in_a_row >= max_failures:
+                stopped_at = i
+                stop_reason = f"{in_a_row} failures in a row"
+                break
+
+    done = (stopped_at if stopped_at else total) - len(failed) - skipped
 
     print(f"\n{'='*50}")
-    print(f"Playlist finished: {playlist_title}")
-    print(f"Tracks processed: {total - len(failed) - skipped}/{total}")
+    print(f"Playlist {'stopped' if stopped_at else 'finished'}: {playlist_title}")
+    print(f"Tracks processed: {done}/{total}")
     if skipped:
         print(f"Already downloaded, skipped: {skipped}")
     print(f"Segments created: {len(created)}")
     print(f"Output folder: {root}/")
     if failed:
         print(f"Failed tracks: {len(failed)}")
-        for title in failed:
+        for title in failed[-10:]:
             print(f"  - {title}")
+        if len(failed) > 10:
+            print(f"  ... {len(failed) - 10} more, see the log")
+    if stopped_at:
+        print(f"Stopped at track {stopped_at} of {total} ({stop_reason}).")
+        print("Run the same command again to carry on from there.")
     print(f"{'='*50}")
 
-    logger.info(f"Playlist done: {total - len(failed) - skipped}/{total} processed, "
-                f"{skipped} skipped, {len(failed)} failed, "
-                f"{len(created)} segments in {root}/")
+    logger.info(f"Playlist {'stopped' if stopped_at else 'done'}: {done}/{total} "
+                f"processed, {skipped} skipped, {len(failed)} failed, "
+                f"{len(created)} segments in {root}/"
+                + (f" - stopped at {stopped_at} ({stop_reason})" if stopped_at else ""))
     if failed:
         logger.warning(f"Failed tracks: {'; '.join(failed)}")
 
     return created
 
 
+def _process_single(url, manual_timestamps=None, mode=MODE_SILENCE, silence_opts=None):
+    """
+    One video, with the short console report that a playlist run does per track.
+    """
+    _status(f"downloading | {url}")
+    try:
+        created = process_youtube_video(url, manual_timestamps, mode, silence_opts)
+    except Exception as e:
+        _line("download failed - see the log")
+        warn_403_once(e)
+        raise
+    _line(f"{len(created)} file{'s' if len(created) != 1 else ''} saved"
+          + (f" to {os.path.dirname(created[0])}/" if created else ""))
+    return created
+
+
 def process_url(url, manual_timestamps=None, mode=MODE_SILENCE, silence_opts=None,
-                playlist_choice=None, interactive=None, overwrite=False):
+                playlist_choice=None, interactive=None, overwrite=False,
+                max_failures=DEFAULT_MAX_FAILURES,
+                attempts=DEFAULT_TRACK_ATTEMPTS):
     """
     Top-level entry point: works out whether the URL means a single video or a
     whole playlist, then hands over to the matching function.
@@ -904,18 +1202,21 @@ def process_url(url, manual_timestamps=None, mode=MODE_SILENCE, silence_opts=Non
                           is interactive, otherwise take the single video:
                           a few hundred tracks should never start unattended).
         interactive     - overrides the automatic detection of an interactive run.
+        max_failures    - consecutive track failures that end a playlist run.
+        attempts        - tries per track before it counts as failed.
 
     Returns list of created segment paths.
     """
     if playlist_choice is False or not extract_playlist_id(url):
-        return process_youtube_video(url, manual_timestamps, mode, silence_opts)
+        return _process_single(url, manual_timestamps, mode, silence_opts)
 
     logger.info("The URL points into a playlist, listing its videos...")
+    print("Listing the playlist...")
     playlist_title, entries, unavailable = fetch_playlist_entries(url)
 
     if not entries:
         logger.warning("Could not list the playlist - processing the single video.")
-        return process_youtube_video(url, manual_timestamps, mode, silence_opts)
+        return _process_single(url, manual_timestamps, mode, silence_opts)
 
     logger.info(f"Playlist videos found: {len(entries)}")
 
@@ -930,10 +1231,10 @@ def process_url(url, manual_timestamps=None, mode=MODE_SILENCE, silence_opts=Non
             playlist_choice = False
 
     if not playlist_choice:
-        return process_youtube_video(url, manual_timestamps, mode, silence_opts)
+        return _process_single(url, manual_timestamps, mode, silence_opts)
 
     return process_playlist(playlist_title, entries, unavailable, manual_timestamps,
-                            mode, silence_opts, overwrite)
+                            mode, silence_opts, overwrite, max_failures, attempts)
 
 
 class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
@@ -978,6 +1279,15 @@ def build_parser():
                    default=None,
                    help='for a URL with a list= parameter, take only the video '
                         'it points at without asking')
+    g.add_argument('--attempts', type=int, default=DEFAULT_TRACK_ATTEMPTS,
+                   metavar='N',
+                   help='tries per track before it counts as failed; YouTube '
+                        'answers 403 on some of its own player clients, and a '
+                        'second go usually lands on a working one')
+    g.add_argument('--max-failures', type=int, default=DEFAULT_MAX_FAILURES,
+                   metavar='N',
+                   help='end a playlist run after this many track failures in '
+                        'a row; 0 never gives up')
     g.add_argument('--overwrite', action='store_true',
                    help='re-download playlist tracks whose folder already holds '
                         'mp3 files (by default they are skipped, so an '
@@ -1123,7 +1433,8 @@ if __name__ == "__main__":
 
     try:
         process_url(url, manual_timestamps, mode=mode, silence_opts=silence_opts,
-                    playlist_choice=args.playlist, overwrite=args.overwrite)
+                    playlist_choice=args.playlist, overwrite=args.overwrite,
+                    max_failures=args.max_failures, attempts=args.attempts)
     except KeyboardInterrupt:
         logger.info("\nOperation cancelled by the user")
     except Exception as e:

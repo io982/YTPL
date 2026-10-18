@@ -54,13 +54,15 @@ def test_setup_logging_writes_a_file(clean_logging, tmp_path):
 
 def test_setup_logging_keeps_the_console_quiet(clean_logging, tmp_path):
     """
-    Without verbose the console stays at INFO while the file records DEBUG.
+    Without verbose the console is left with warnings and errors only, while
+    the file records DEBUG: progress is shown by the status line instead, and
+    the running commentary would only bury it.
     """
     YTPL.setup_logging(str(tmp_path / 'run.log'))
     console = clean_logging.handlers[0]
     file_handler = clean_logging.handlers[-1]
 
-    assert console.level == logging.INFO
+    assert console.level == logging.WARNING
     assert file_handler.level == logging.DEBUG
     assert clean_logging.level == logging.DEBUG
 
@@ -114,8 +116,11 @@ def test_log_environment_survives_a_broken_ffmpeg(clean_logging, caplog, monkeyp
     ('debug', '[debug] inner detail', 'DEBUG'),
     ('debug', '[youtube] Downloading API JSON', 'INFO'),
     ('info', 'plain info', 'INFO'),
-    ('warning', 'careful', 'WARNING'),
-    ('error', 'ERROR: HTTP Error 403: Forbidden', 'ERROR'),
+    # yt-dlp's warnings and errors are kept off the console: YTPL reports the
+    # outcome of each track itself, with the same text, and the detail is in
+    # the log file either way.
+    ('warning', 'careful', 'INFO'),
+    ('error', 'ERROR: HTTP Error 403: Forbidden', 'INFO'),
 ])
 def test_ytdlp_logger_bridge(caplog, method, message, level):
     """
@@ -128,6 +133,19 @@ def test_ytdlp_logger_bridge(caplog, method, message, level):
 
     assert caplog.records[-1].levelname == level
     assert message in caplog.text
+
+
+def test_ytdlp_problems_are_labelled(caplog):
+    """
+    Downgraded to INFO, they still have to be findable in the log.
+    """
+    bridge = YTPL._YtdlpLogger()
+    with caplog.at_level(logging.DEBUG):
+        bridge.warning('n challenge solving failed')
+        bridge.error('HTTP Error 403')
+
+    assert '[yt-dlp warning] n challenge solving failed' in caplog.text
+    assert '[yt-dlp error] HTTP Error 403' in caplog.text
 
 
 def test_download_progress_reports_a_finished_file(caplog):
