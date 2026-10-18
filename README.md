@@ -22,6 +22,9 @@ explicitly with `--from-description`.
 - **Chapters and description timestamps on demand (`--from-description`)**:
   YouTube chapters first, then description regexes, then page HTML
 - Manual timestamps (`--timestamps 145,325`)
+- **Playlists**: a `list=` URL offers the whole playlist or just the one
+  video; every track is then checked for pauses the same way
+- **Full log file** (`ytpl.log`) with yt-dlp's own output and tracebacks
 - Timestamp formats: `&t=145s`, `?t=2m25s`, `=1102s` in URLs, `MM:SS`, `HH:MM:SS`
 - Splits into MP3 segments with ffmpeg, sanitized filenames
 - Timestamp validation (invalid/overlapping ones are skipped)
@@ -70,6 +73,12 @@ Passing a URL as an argument runs the default mode without any questions.
 | `-d`, `--from-description` | force timestamps from chapters/description instead of silence analysis (aliases: `--desc`, `--chapters`) |
 | `-t`, `--timestamps 145,325` | your own cut points in seconds |
 | `--silence` | explicitly select the default mode |
+| `--playlist` | for a `list=` URL, take every track without asking |
+| `--no-playlist` | for a `list=` URL, take only the video it points at |
+| `--overwrite` | re-download playlist tracks that are already on disk |
+| `--log-file PATH` | where to write the log (default `ytpl.log`) |
+| `--no-log-file` | do not write a log file |
+| `-v`, `--verbose` | debug output on the console, and yt-dlp's own |
 | `--noise 30dB` | silence volume threshold (default `-30dB`; the minus sign may be omitted, or use `--noise=-30dB`) |
 | `--min-silence 1.5` | starting pause-length threshold, seconds |
 | `--floor 0.8` | lowest pause-length threshold, seconds |
@@ -83,6 +92,61 @@ python YTPL.py "https://youtu.be/VIDEO_ID" --from-description
 python YTPL.py "https://youtu.be/VIDEO_ID" --min-segment 60 --max-segment 420
 python YTPL.py "https://youtu.be/VIDEO_ID" -t 0,185,420,735
 ```
+
+## Playlists
+
+A URL carrying a `list=` parameter points into a playlist. YTPL then offers a
+choice:
+
+```
+This URL belongs to a playlist: "Essential NewRetroWave Vocal Jams" (426 tracks).
+  [Enter] - download the whole playlist
+  o       - only the video the URL points at
+```
+
+Use `--playlist` or `--no-playlist` to answer in advance. A **non-interactive
+run takes only the single video** unless `--playlist` is given: a few hundred
+tracks should never start downloading unattended.
+
+**The whole playlist is listed, not just the part a browser shows.** The web
+page loads around 200 items and fetches more as you scroll, but yt-dlp walks
+that pagination itself, so a 429-entry playlist comes back complete in a few
+seconds. The listing is flat (no per-video metadata), which is what keeps it
+that fast. Deleted and private entries come back without a title; they are
+counted and skipped.
+
+Each track is then processed exactly like a single video, so the pauses inside
+it are analysed the same way. The layout is one folder per track inside the
+playlist folder:
+
+```
+Essential_NewRetroWave_Vocal_Jams/
+  Sun_City_-_Restless_Heart/
+    Sun_City_-_Restless_Heart_0001.mp3
+  Thought_Beings_-_Sky_High/
+    Thought_Beings_-_Sky_High_0001.mp3
+```
+
+A track whose folder already holds mp3 files is skipped, so an interrupted run
+resumes where it stopped; `--overwrite` downloads them again. A track that
+fails does not stop the run - the error is logged and the summary at the end
+lists every failure.
+
+## Logging
+
+Every run writes `ytpl.log` next to the output (change it with `--log-file`,
+switch it off with `--no-log-file`). The console stays readable while the file
+records everything at DEBUG: the environment banner (Python, platform, yt-dlp
+and ffmpeg versions), yt-dlp's own messages, the resolved format, and full
+tracebacks. A console line like
+
+```
+ERROR - Download failed for https://...: HTTP Error 403: Forbidden
+```
+
+has its whole traceback and the yt-dlp exchange that led to it in the file.
+`-v` additionally shows the debug lines on the console and asks yt-dlp for its
+own debug output.
 
 ## Mode priority
 
@@ -121,6 +185,17 @@ merging), mode selection and the actual ffmpeg splitting.
 - ffmpeg availability is checked before processing
 
 ## Changelog of the latest version
+
+- **Playlist support**: a `list=` URL offers the whole playlist or the single
+  video; the whole listing is enumerated (not only the ~200 items a browser
+  shows), unavailable entries are skipped, finished tracks are skipped on a
+  rerun, and a failing track does not stop the run
+- **Fixed: a `list=` URL used to crash**, because yt-dlp returned the playlist
+  rather than the video and the result has no `duration` field. Single-video
+  downloads now pass `noplaylist`
+- **Logging**: a full-detail `ytpl.log`, the environment banner, yt-dlp's own
+  output routed into the log, tracebacks in the file and one line on the
+  console, plus `--log-file` / `--no-log-file` / `-v`
 
 - **Silence analysis is now the default; chapters and description are used only
   with `--from-description`**

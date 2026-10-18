@@ -4,7 +4,9 @@ import os
 import sys
 import math
 import argparse
+import platform
 import subprocess
+import urllib.parse
 import imageio_ffmpeg
 import requests
 from bs4 import BeautifulSoup
@@ -12,11 +14,14 @@ import tempfile
 import logging
 
 # Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
+DEFAULT_LOG_FILE = 'ytpl.log'
+
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
+
+# Whether to ask yt-dlp for its own debug output; set by setup_logging().
+_ytdlp_verbose = False
 
 # Ways of finding cut points.
 #   MODE_SILENCE - silence analysis. The default: on mixes, author timestamps
@@ -109,6 +114,102 @@ def extract_timestamps(text):
             continue
 
     return sorted(set(timestamps))
+
+def setup_logging(log_file=DEFAULT_LOG_FILE, verbose=False):
+    """
+    Console logging plus a full-detail log file.
+
+    The console stays readable (INFO, or DEBUG with verbose) while the file
+    always records DEBUG. That is deliberate: when a download fails, what tells
+    a YouTube-side block apart from a local problem is yt-dlp's own output and
+    the environment banner, and both are too noisy for the console.
+
+    Returns the path of the log file, or None when no file is written.
+    """
+    global _ytdlp_verbose
+    _ytdlp_verbose = verbose
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    for handler in root.handlers:
+        handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+    if not log_file:
+        return None
+
+    try:
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    except OSError as e:
+        logger.warning(f"Could not open the log file {log_file}: {e}")
+        return None
+
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    root.addHandler(file_handler)
+    return log_file
+
+
+def log_environment():
+    """
+    Record what this run is working with. A download that fails for every video
+    (YouTube blocking an outdated yt-dlp, say) looks nothing like a local
+    problem, and these lines are what tell them apart after the fact.
+    """
+    logger.info(f"YTPL starting - Python {sys.version.split()[0]}, {platform.platform()}")
+    logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
+    try:
+        logger.info(f"ffmpeg {imageio_ffmpeg.get_ffmpeg_version()} "
+                    f"at {imageio_ffmpeg.get_ffmpeg_exe()}")
+    except Exception as e:
+        logger.warning(f"Could not query ffmpeg: {e}")
+    logger.debug(f"Working directory: {os.getcwd()}")
+    logger.debug(f"Command line: {' '.join(sys.argv)}")
+
+
+class _YtdlpLogger:
+    """
+    Routes yt-dlp's own messages into the logging module, so they reach the log
+    file as well. This is where a '403 Forbidden', a missing JavaScript runtime
+    or a format-selection problem actually shows up.
+    """
+    def debug(self, msg):
+        # yt-dlp sends ordinary screen output here too; only the lines it marks
+        # itself are real debug detail.
+        if msg.startswith('[debug] '):
+            logger.debug(msg)
+        else:
+            logger.info(msg)
+
+    def info(self, msg):
+        logger.info(msg)
+
+    def warning(self, msg):
+        logger.warning(msg)
+
+    def error(self, msg):
+        logger.error(msg)
+
+
+def _download_progress(status):
+    """
+    One line per finished download instead of yt-dlp's live progress bar, which
+    would be thousands of lines in the log file on a long playlist.
+    """
+    state = status.get('status')
+    if state == 'finished':
+        size = status.get('total_bytes') or status.get('downloaded_bytes') or 0
+        logger.info(f"Downloaded {size / 1048576:.1f} MB "
+                    f"in {status.get('elapsed') or 0:.0f}s")
+    elif state == 'error':
+        logger.error(f"yt-dlp reported a download error: {status.get('filename')}")
+
+
+def sanitize_name(name):
+    """
+    Turn a video or playlist title into a safe file/folder name.
+    """
+    return re.sub(r'[^\w\-_\. ]', '_', name).replace(' ', '_')
+
 
 def timestamps_from_metadata(url, description, chapters):
     """
@@ -299,10 +400,14 @@ def detect_silence_timestamps(audio_path, duration, noise_tol='-30dB',
     return cuts
 
 
-def download_audio(url):
+def download_audio(url, verbose=None):
     """
     Download audio from YouTube video using yt-dlp.
     Returns path to downloaded MP3 file, title, description, duration, chapters, temp_dir_path.
+
+    Parameters:
+        verbose - ask yt-dlp for its own debug output; None uses what
+                  setup_logging() was given.
     """
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     temp_dir_path = tempfile.mkdtemp(prefix='ytpl_audio_')
@@ -311,39 +416,58 @@ def download_audio(url):
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': outtmpl,
-        'quiet': False,
+        'quiet': True,              # yt-dlp's own output goes through the logger below
         'no_warnings': False,
+        'noprogress': True,         # the progress bar would flood the log file
+        'logger': _YtdlpLogger(),
+        'progress_hooks': [_download_progress],
+        'verbose': _ytdlp_verbose if verbose is None else verbose,
         'socket_timeout': 60,       # raised socket timeout (the default was 20)
         'retries': 10,              # download retry attempts
         'fragment_retries': 10,     # retries for fragmented streams
         'http_chunk_size': 10485760, # 10 MB chunks - help on an unstable connection
         'js_runtimes': {'node': {}}, # use the installed Node.js to decrypt YouTube URLs (otherwise throttling and timeouts)
+        'noplaylist': True,         # a '&list=' URL means this video only; playlists are walked by process_playlist
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        title = info['title']
-        description = info.get('description', '')
-        duration = info['duration']
-        chapters = info.get('chapters')  # structural YouTube chapters, if the author set them
-        ext = info.get('ext', 'm4a')
+    logger.debug(f"Downloading {url} into {temp_dir_path}")
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except Exception as e:
+        # One line on the console, the whole traceback in the log file.
+        logger.error(f"Download failed for {url}: {e}")
+        logger.debug("Download traceback", exc_info=True)
+        raise
 
-        # Locate the downloaded file
-        downloaded_file = None
-        for f in os.listdir(temp_dir_path):
-            downloaded_file = os.path.join(temp_dir_path, f)
-            break
+    title = info['title']
+    description = info.get('description', '')
+    duration = info['duration']
+    chapters = info.get('chapters')  # structural YouTube chapters, if the author set them
+    ext = info.get('ext', 'm4a')
 
-        if not downloaded_file or not os.path.exists(downloaded_file):
-            raise FileNotFoundError("Audio file was not downloaded successfully")
+    logger.debug(f"Resolved: title={title!r}, duration={duration}s, "
+                 f"format={info.get('format_id')} {ext} abr={info.get('abr')}, "
+                 f"chapters={len(chapters) if chapters else 0}, "
+                 f"description={len(description)} chars")
 
-        if ext.lower() == 'mp3':
-            mp3_file = downloaded_file  # already MP3, use as is
-        else:
-            mp3_file = os.path.join(temp_dir_path, 'audio.mp3')
-            cmd = [ffmpeg_path, '-i', downloaded_file, '-q:a', '0', '-y', mp3_file]
-            subprocess.run(cmd, check=True)
-            if os.path.exists(downloaded_file):
-                os.remove(downloaded_file)
+    # Locate the downloaded file
+    downloaded_file = None
+    for f in os.listdir(temp_dir_path):
+        downloaded_file = os.path.join(temp_dir_path, f)
+        break
+
+    if not downloaded_file or not os.path.exists(downloaded_file):
+        raise FileNotFoundError("Audio file was not downloaded successfully")
+
+    if ext.lower() == 'mp3':
+        mp3_file = downloaded_file  # already MP3, use as is
+    else:
+        logger.debug(f"Converting {ext} to mp3")
+        mp3_file = os.path.join(temp_dir_path, 'audio.mp3')
+        cmd = [ffmpeg_path, '-i', downloaded_file, '-q:a', '0', '-y', mp3_file]
+        subprocess.run(cmd, check=True)
+        if os.path.exists(downloaded_file):
+            os.remove(downloaded_file)
 
     return mp3_file, title, description, duration, chapters, temp_dir_path
 
@@ -410,7 +534,7 @@ def split_audio(audio_path, timestamps, duration, base_name='video', output_dir=
     return created_files
 
 def process_youtube_video(url, manual_timestamps=None, mode=MODE_SILENCE,
-                          silence_opts=None):
+                          silence_opts=None, output_root=None, output_name=None):
     """
     Main function to process YouTube video.
 
@@ -418,6 +542,11 @@ def process_youtube_video(url, manual_timestamps=None, mode=MODE_SILENCE,
         manual_timestamps - a string like '145,325'; when given, the mode is always MODE_MANUAL.
         mode              - MODE_SILENCE (the default), MODE_META or MODE_MANUAL.
         silence_opts      - dict of detect_silence_timestamps parameters.
+        output_root       - parent folder for the output (used for playlists).
+        output_name       - folder and file name to use instead of one derived
+                            from the video title. A playlist passes it so the
+                            folder is known before the download and finished
+                            tracks can be recognised on a rerun.
 
     Returns list of created segment paths.
     """
@@ -462,8 +591,8 @@ def process_youtube_video(url, manual_timestamps=None, mode=MODE_SILENCE,
                     return []
 
         # Split audio
-        base_name = re.sub(r'[^\w\-_\. ]', '_', title).replace(' ', '_')
-        output_dir = base_name
+        base_name = output_name or sanitize_name(title)
+        output_dir = os.path.join(output_root, base_name) if output_root else base_name
         os.makedirs(output_dir, exist_ok=True)
 
         logger.info("Splitting audio into segments...")
@@ -475,6 +604,7 @@ def process_youtube_video(url, manual_timestamps=None, mode=MODE_SILENCE,
         print(f"Output folder: {output_dir}/")
         print(f"{'='*50}")
 
+        logger.info(f"Done: {len(created_segments)} segments in {output_dir}/")
         return created_segments
 
     except Exception as e:
@@ -490,6 +620,211 @@ def process_youtube_video(url, manual_timestamps=None, mode=MODE_SILENCE,
             except Exception as cleanup_error:
                 logger.warning(f"Could not remove the temporary files: {cleanup_error}")
 
+def extract_playlist_id(url):
+    """
+    Return the value of the `list=` parameter, or None when the URL has none.
+    """
+    try:
+        query = urllib.parse.urlparse(url).query
+    except ValueError:
+        return None
+    values = urllib.parse.parse_qs(query).get('list') or []
+    return values[0] if values and values[0] else None
+
+
+def fetch_playlist_entries(url):
+    """
+    List every video of a playlist.
+
+    yt-dlp walks the playlist pagination on its own, so this returns the whole
+    list even for playlists whose web page only renders the first 100-200 items
+    until you scroll. Extraction is flat: one request chain for the listing, no
+    per-video metadata, so a 400+ track playlist takes a few seconds.
+
+    Returns:
+        (playlist title, [{'id', 'title', 'url'}, ...], number of unavailable
+        entries). A URL that is not a playlist yields (None, [], 0).
+    """
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'extract_flat': 'in_playlist',
+        'socket_timeout': 60,
+        'retries': 10,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    if not info or info.get('_type') != 'playlist':
+        return None, [], 0
+
+    entries = []
+    unavailable = 0
+    for entry in (info.get('entries') or []):
+        # Deleted and private videos come back as stubs without a title.
+        if not entry or not entry.get('id') or not entry.get('title'):
+            unavailable += 1
+            continue
+        entries.append({
+            'id': entry['id'],
+            'title': entry['title'],
+            'url': entry.get('url') or f"https://www.youtube.com/watch?v={entry['id']}",
+        })
+    return info.get('title'), entries, unavailable
+
+
+def prompt_playlist(playlist_title, count):
+    """
+    Ask what to do with a URL that points into a playlist.
+    Returns True for the whole playlist, False for the single video.
+    """
+    print()
+    print(f'This URL belongs to a playlist: "{playlist_title}" ({count} tracks).')
+    print("  [Enter] - download the whole playlist")
+    print("  o       - only the video the URL points at")
+    return input("Choice: ").strip().lower() not in ('o', 'one', 'single', 'n', 'no')
+
+
+def _has_mp3(directory):
+    """
+    Whether the folder already holds at least one mp3. Used to resume a run:
+    on a long playlist a dropped connection should not mean starting over.
+    """
+    try:
+        return any(f.lower().endswith('.mp3') for f in os.listdir(directory))
+    except OSError:
+        return False
+
+
+def process_playlist(playlist_title, entries, unavailable=0, manual_timestamps=None,
+                     mode=MODE_SILENCE, silence_opts=None, overwrite=False):
+    """
+    Process every video of a playlist. Each track goes through the same
+    pipeline as a single video, so its pauses are analysed the same way, and
+    every track gets its own folder inside the playlist folder.
+
+    A failing track does not stop the run: the error is logged and the summary
+    at the end lists what failed. Tracks whose folder already holds mp3 files
+    are skipped unless overwrite is set.
+
+    Returns list of created segment paths.
+    """
+    root = sanitize_name(playlist_title or 'playlist')
+    os.makedirs(root, exist_ok=True)
+
+    total = len(entries)
+    logger.info(f"Playlist: {playlist_title} - {total} tracks, output folder {root}/")
+    if unavailable:
+        logger.warning(f"Skipped unavailable entries: {unavailable} (deleted or private)")
+    if manual_timestamps:
+        logger.warning("Manual timestamps are applied to every track of the playlist")
+
+    created = []
+    failed = []
+    skipped = 0
+
+    for i, entry in enumerate(entries, 1):
+        # The folder name is fixed here, not derived from the title fetched at
+        # download time: the two can differ, and then a rerun would re-download
+        # a track that is already on disk.
+        track_name = sanitize_name(entry['title'])
+        track_dir = os.path.join(root, track_name)
+        if not overwrite and _has_mp3(track_dir):
+            skipped += 1
+            logger.info(f"[{i}/{total}] already done, skipping: {entry['title']}")
+            continue
+
+        logger.info(f"[{i}/{total}] {entry['title']}")
+        try:
+            created += process_youtube_video(entry['url'], manual_timestamps, mode,
+                                             silence_opts, output_root=root,
+                                             output_name=track_name)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            logger.error(f"[{i}/{total}] failed on {entry['title']}: {e}")
+            logger.debug(f"Failed track URL: {entry['url']}", exc_info=True)
+            failed.append(entry['title'])
+
+    print(f"\n{'='*50}")
+    print(f"Playlist finished: {playlist_title}")
+    print(f"Tracks processed: {total - len(failed) - skipped}/{total}")
+    if skipped:
+        print(f"Already downloaded, skipped: {skipped}")
+    print(f"Segments created: {len(created)}")
+    print(f"Output folder: {root}/")
+    if failed:
+        print(f"Failed tracks: {len(failed)}")
+        for title in failed:
+            print(f"  - {title}")
+    print(f"{'='*50}")
+
+    logger.info(f"Playlist done: {total - len(failed) - skipped}/{total} processed, "
+                f"{skipped} skipped, {len(failed)} failed, "
+                f"{len(created)} segments in {root}/")
+    if failed:
+        logger.warning(f"Failed tracks: {'; '.join(failed)}")
+
+    return created
+
+
+def process_url(url, manual_timestamps=None, mode=MODE_SILENCE, silence_opts=None,
+                playlist_choice=None, interactive=None, overwrite=False):
+    """
+    Top-level entry point: works out whether the URL means a single video or a
+    whole playlist, then hands over to the matching function.
+
+    Parameters:
+        playlist_choice - True to take the whole playlist, False for just the
+                          single video, None to decide here (ask when the run
+                          is interactive, otherwise take the single video:
+                          a few hundred tracks should never start unattended).
+        interactive     - overrides the automatic detection of an interactive run.
+
+    Returns list of created segment paths.
+    """
+    if playlist_choice is False or not extract_playlist_id(url):
+        return process_youtube_video(url, manual_timestamps, mode, silence_opts)
+
+    logger.info("The URL points into a playlist, listing its videos...")
+    playlist_title, entries, unavailable = fetch_playlist_entries(url)
+
+    if not entries:
+        logger.warning("Could not list the playlist - processing the single video.")
+        return process_youtube_video(url, manual_timestamps, mode, silence_opts)
+
+    logger.info(f"Playlist videos found: {len(entries)}")
+
+    if playlist_choice is None:
+        if interactive is None:
+            interactive = sys.stdin is not None and sys.stdin.isatty()
+        if interactive:
+            playlist_choice = prompt_playlist(playlist_title, len(entries))
+        else:
+            logger.info("Non-interactive run: taking the single video "
+                        "(pass --playlist for the whole playlist).")
+            playlist_choice = False
+
+    if not playlist_choice:
+        return process_youtube_video(url, manual_timestamps, mode, silence_opts)
+
+    return process_playlist(playlist_title, entries, unavailable, manual_timestamps,
+                            mode, silence_opts, overwrite)
+
+
+class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    """
+    Shows defaults the way ArgumentDefaultsHelpFormatter does, but stays quiet
+    about flags that have no meaningful default: an off switch does not need a
+    '(default: False)' note, and the playlist pair defaults to asking.
+    """
+    def _get_help_string(self, action):
+        if action.default is None or action.default is False:
+            return action.help
+        return super()._get_help_string(action)
+
+
 def build_parser():
     """
     Command-line argument parsing. With no arguments the script asks for
@@ -501,7 +836,7 @@ def build_parser():
                     'tracks. Splits by pauses in the audio by default; chapters '
                     'and description timestamps are only used with '
                     '--from-description.',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+        formatter_class=_HelpFormatter)
     p.add_argument('url', nargs='?', help='YouTube video URL')
     p.add_argument('-t', '--timestamps', metavar='SEC',
                    help="your own timestamps in seconds, comma-separated, e.g. '145,325'")
@@ -511,6 +846,27 @@ def build_parser():
                         'instead of silence analysis')
     p.add_argument('--silence', dest='force_silence', action='store_true',
                    help='explicitly select silence analysis (the default mode)')
+
+    g = p.add_argument_group('playlists')
+    g.add_argument('--playlist', dest='playlist', action='store_true', default=None,
+                   help='for a URL with a list= parameter, take every track of '
+                        'the playlist without asking')
+    g.add_argument('--no-playlist', dest='playlist', action='store_false',
+                   default=None,
+                   help='for a URL with a list= parameter, take only the video '
+                        'it points at without asking')
+    g.add_argument('--overwrite', action='store_true',
+                   help='re-download playlist tracks whose folder already holds '
+                        'mp3 files (by default they are skipped, so an '
+                        'interrupted playlist run resumes)')
+
+    g = p.add_argument_group('logging')
+    g.add_argument('--log-file', default=DEFAULT_LOG_FILE, metavar='PATH',
+                   help='write a full-detail log to this file')
+    g.add_argument('--no-log-file', dest='log_file', action='store_const', const=None,
+                   help='do not write a log file')
+    g.add_argument('-v', '--verbose', action='store_true',
+                   help="show debug output on the console and ask yt-dlp for its own")
 
     g = p.add_argument_group('silence analysis settings')
     g.add_argument('--noise', default='-30dB', metavar='dB',
@@ -605,6 +961,11 @@ def silence_opts_from_args(args):
 if __name__ == "__main__":
     args = build_parser().parse_args()
 
+    log_path = setup_logging(args.log_file, args.verbose)
+    log_environment()
+    if log_path:
+        print(f"Log file: {log_path}")
+
     # Check that ffmpeg is available
     try:
         ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
@@ -626,15 +987,18 @@ if __name__ == "__main__":
     silence_opts = silence_opts_from_args(args)
 
     try:
-        process_youtube_video(url, manual_timestamps, mode=mode,
-                              silence_opts=silence_opts)
+        process_url(url, manual_timestamps, mode=mode, silence_opts=silence_opts,
+                    playlist_choice=args.playlist, overwrite=args.overwrite)
     except KeyboardInterrupt:
         logger.info("\nOperation cancelled by the user")
     except Exception as e:
         logger.error(f"An error occurred: {e}")
+        logger.debug("Traceback", exc_info=True)
         print(f"\n[ERROR] {e}")
         print("Possible fixes:")
         print("  1. Check your internet connection")
         print("  2. Update yt-dlp: pip install -U yt-dlp")
         print("  3. Update imageio-ffmpeg: pip install -U imageio-ffmpeg")
         print("  4. Try a different YouTube link")
+        if log_path:
+            print(f"  Details of this run are in {log_path}")

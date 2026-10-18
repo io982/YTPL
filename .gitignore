@@ -2,5 +2,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# Log file written by every run
+ytpl.log
+
 # Output of the script: folders with the split tracks
 *.mp3
