@@ -11,19 +11,19 @@ from bs4 import BeautifulSoup
 import tempfile
 import logging
 
-# Настройка логирования
+# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Режимы поиска точек реза.
-#   MODE_SILENCE — анализ пауз в аудио. Режим по умолчанию: таймкоды авторов на
-#                  миксах часто размечают не треки, а блоки по 15-20 минут, и
-#                  нарезка по ним склеивает несколько треков в один файл.
-#   MODE_META    — главы/описание видео. Включается только принудительно.
-#   MODE_MANUAL  — таймкоды, заданные пользователем.
+# Ways of finding cut points.
+#   MODE_SILENCE - silence analysis. The default: on mixes, author timestamps
+#                  often mark 15-20 minute blocks rather than tracks, so cutting
+#                  by them glues several tracks into a single file.
+#   MODE_META    - video chapters/description. Only when explicitly requested.
+#   MODE_MANUAL  - timestamps supplied by the user.
 MODE_SILENCE = 'silence'
 MODE_META = 'meta'
 MODE_MANUAL = 'manual'
@@ -112,37 +112,37 @@ def extract_timestamps(text):
 
 def timestamps_from_metadata(url, description, chapters):
     """
-    Таймкоды из метаданных видео (используются только в режиме MODE_META).
-    Порядок источников:
-      1) структурные главы YouTube (info['chapters']) — самый надёжный;
-      2) регэкспы по описанию;
-      3) скрапинг HTML-страницы (слабый фолбэк).
+    Timestamps taken from the video metadata (used in MODE_META only).
+    Source order:
+      1) structural YouTube chapters (info['chapters']) - the most reliable;
+      2) regexes over the description;
+      3) scraping the page HTML (weak fallback).
 
     Returns:
-        (список таймкодов в секундах, название источника).
+        (list of timestamps in seconds, name of the source).
     """
     if chapters:
-        # Границы треков — это старты глав (стартовую главу с 0 пропускаем).
+        # Track boundaries are the chapter starts (the one at 0 is skipped).
         timestamps = sorted({round(float(c['start_time']), 3) for c in chapters
                              if c.get('start_time') and float(c['start_time']) > 0})
         if timestamps:
-            return timestamps, f'главы YouTube ({len(chapters)} шт.)'
+            return timestamps, f'YouTube chapters ({len(chapters)} of them)'
 
     timestamps = extract_timestamps(description)
     if timestamps:
-        return timestamps, 'описание видео'
+        return timestamps, 'video description'
 
     timestamps = extract_timestamps(get_full_page_text(url))
     if timestamps:
-        return timestamps, 'HTML-страница видео'
+        return timestamps, 'video page HTML'
 
-    return [], 'не найдено'
+    return [], 'nothing found'
 
 
 def _run_silencedetect(audio_path, noise_tol, min_silence_dur):
     """
-    Запускает ffmpeg silencedetect один раз и возвращает список пауз как
-    кортежи (start, end) в секундах.
+    Run ffmpeg silencedetect once and return the detected pauses as
+    (start, end) tuples in seconds.
     """
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     cmd = [
@@ -172,23 +172,23 @@ def _run_silencedetect(audio_path, noise_tol, min_silence_dur):
 def _segment_recursive(candidates, start, end, level_idx, levels,
                        max_segment_len, hard_split_len):
     """
-    Рекурсивно подбирает точки реза для участка (start, end).
+    Recursively pick cut points for the (start, end) piece.
 
-    candidates      — отсортированный список (midpoint, silence_duration) всех пауз.
-    levels          — убывающий список порогов min_silence_dur, напр. [1.5, 1.15, 0.8].
-    level_idx       — с какого порога начинать для этого участка.
-    max_segment_len — участок длиннее этого считается «слишком длинным».
-    hard_split_len  — если тишин не хватило даже на минимальном пороге, режем по этой длине.
+    candidates      - sorted list of (midpoint, silence_duration) for every pause.
+    levels          - descending list of min_silence_dur thresholds, e.g. [1.5, 1.15, 0.8].
+    level_idx       - which threshold to start from for this piece.
+    max_segment_len - a piece longer than this counts as "too long".
+    hard_split_len  - if even the lowest threshold found no pauses, split by this length.
 
-    Логика: если участок длинный — пробуем текущий порог; нет внутренних пауз —
-    понижаем порог (следующий уровень), перечитывая тот же участок. Дошли до
-    минимального порога и участок всё ещё длинный — рубим жёстко по hard_split_len.
-    Возвращает точки реза строго внутри (start, end).
+    The logic: while the piece is long, try the current threshold; if it holds no
+    internal pauses, lower the threshold (next level) and look at the same piece
+    again. Once the lowest threshold is reached and the piece is still long, split
+    it hard by hard_split_len. Returns cut points strictly inside (start, end).
     """
     if end - start <= max_segment_len:
         return []
 
-    # Пробуем пороги от текущего и ниже, пока внутри участка не найдутся паузы.
+    # Try thresholds from the current one downwards until pauses show up inside.
     for li in range(level_idx, len(levels)):
         thr = levels[li]
         internal = [mid for (mid, dur) in candidates if start < mid < end and dur >= thr]
@@ -198,15 +198,15 @@ def _segment_recursive(candidates, start, end, level_idx, levels,
             for i in range(len(bounds) - 1):
                 s, e = bounds[i], bounds[i + 1]
                 if i > 0:
-                    cuts.append(s)  # сама граница-пауза — это точка реза
-                # Каждый под-участок дочищаем уже более низким порогом.
+                    cuts.append(s)  # the pause boundary itself is a cut point
+                # Every sub-piece is refined with an already lower threshold.
                 cuts += _segment_recursive(candidates, s, e, li + 1, levels,
                                            max_segment_len, hard_split_len)
             return sorted(set(cuts))
 
-    # Тишин не нашлось даже на минимальном пороге — режем участок жёстко.
-    # Равномерно на ceil(длина / hard_split_len) частей: все куски <= hard_split_len,
-    # одинаковой длины, без крошечного хвоста в конце.
+    # No pauses even at the lowest threshold - split the piece hard.
+    # Evenly into ceil(length / hard_split_len) parts: every part is
+    # <= hard_split_len, all of equal length, with no tiny tail at the end.
     seg_len = end - start
     n_parts = int(math.ceil(seg_len / hard_split_len))
     part = seg_len / n_parts
@@ -215,59 +215,62 @@ def _segment_recursive(candidates, start, end, level_idx, levels,
 
 def _enforce_min_segment(cuts, total, min_seg):
     """
-    Убирает точки реза, порождающие слишком короткие сегменты (< min_seg):
-    такой рез отбрасывается, а огрызок сливается с соседним сегментом.
-    Гарантирует, что все итоговые сегменты (включая последний) >= min_seg.
+    Drop cut points that would produce segments shorter than min_seg: such a cut
+    is discarded and the stub is merged into the neighbouring segment.
+    Guarantees every resulting segment (the last one included) is >= min_seg.
     """
     bounds = [0.0] + sorted(cuts) + [float(total)]
     kept = [0.0]
     for b in bounds[1:-1]:
         if b - kept[-1] >= min_seg:
             kept.append(b)
-    # Хвост: если последний сегмент коротковат — отбрасываем последние резы.
+    # Tail: while the last segment is too short, drop the trailing cuts.
     while len(kept) > 1 and total - kept[-1] < min_seg:
         kept.pop()
-    return kept[1:]  # только внутренние точки реза
+    return kept[1:]  # internal cut points only
 
 
 def detect_silence_timestamps(audio_path, duration, noise_tol='-30dB',
                               min_silence_dur=1.5, floor=0.8, step=0.35,
                               max_segment_len=300.0, min_segment=15.0):
     """
-    Рекурсивная нарезка по паузам. Начинает с порога min_silence_dur (1.5 с) и,
-    пока остаются участки длиннее max_segment_len (5 мин), понижает порог вплоть
-    до floor (0.8 с). Что осталось слишком длинным — режется жёстко по 5 минут.
+    Recursive splitting by pauses. Starts at the min_silence_dur threshold
+    (1.5 s) and keeps lowering it down to floor (0.8 s) while any piece is
+    longer than max_segment_len (5 min). Whatever stays too long is split hard
+    by that same length.
 
-    Реализация: один проход silencedetect на floor (даёт все паузы >= 0.8 с с их
-    длительностями), а уровни порога отрабатываются фильтрацией по длительности —
-    это идентично повторному перечитыванию участка на каждом уровне.
+    Implementation: a single silencedetect pass at floor (which yields every
+    pause >= 0.8 s together with its duration), and the threshold levels are
+    then applied by filtering on duration - identical to re-reading the piece
+    at every level.
 
     Parameters:
-        noise_tol       — порог громкости тишины (по умолчанию -30dB).
-        min_silence_dur — стартовый порог длины паузы (по умолчанию 1.5 с).
-        floor           — минимальный порог длины паузы (по умолчанию 0.8 с).
-        step            — шаг понижения порога (по умолчанию 0.35 с).
-        max_segment_len — участок длиннее этого считается слишком длинным (5 мин).
+        noise_tol       - silence volume threshold (default -30dB).
+        min_silence_dur - starting pause-length threshold (default 1.5 s).
+        floor           - lowest pause-length threshold (default 0.8 s).
+        step            - threshold lowering step (default 0.35 s).
+        max_segment_len - a piece longer than this counts as too long (5 min).
+        min_segment     - minimum track length (default 15 s).
 
     Returns:
-        Отсортированный список точек реза (секунды).
+        Sorted list of cut points (seconds).
     """
-    logger.info(f"Запуск silencedetect (шум={noise_tol}, мин. пауза={floor}s, "
-                f"рекурсия {min_silence_dur}→{floor}s, макс. участок={max_segment_len}s)...")
+    logger.info(f"Running silencedetect (noise={noise_tol}, min pause={floor}s, "
+                f"recursion {min_silence_dur}->{floor}s, max piece={max_segment_len}s)...")
 
     raw = _run_silencedetect(audio_path, noise_tol, floor)
 
-    # Кандидаты: середины пауз с их длительностью. Стартовую тишину пропускаем.
+    # Candidates: pause midpoints with their durations. Leading silence is skipped.
     candidates = []
     for s_start, s_end in raw:
         if s_start <= 0.1:
             continue
         midpoint = (s_start + s_end) / 2
-        if 0 < midpoint < duration - 1.0:  # не вплотную к концу
+        if 0 < midpoint < duration - 1.0:  # not right up against the end
             candidates.append((midpoint, s_end - s_start))
     candidates.sort()
 
-    # Убывающие уровни порога: 1.5, 1.15, ..., 0.8.
+    # Descending threshold levels: 1.5, 1.15, ..., 0.8.
     levels = []
     t = min_silence_dur
     while t > floor:
@@ -275,14 +278,14 @@ def detect_silence_timestamps(audio_path, duration, noise_tol='-30dB',
         t -= step
     levels.append(floor)
 
-    # Первый проход на стартовом пороге делаем всегда, независимо от длины
-    # участка: явная пауза между треками — это граница треков и в коротком
-    # видео (иначе альбом короче max_segment_len не резался бы вовсе).
+    # The first pass at the starting threshold always runs, whatever the piece
+    # length: a clear pause between tracks is a track boundary in a short video
+    # too (otherwise an album shorter than max_segment_len would never be split).
     base = sorted(mid for (mid, dur) in candidates if dur >= levels[0])
     cuts = list(base)
 
-    # Понижение порога и жёсткий рез — только для участков, которые остались
-    # слишком длинными после первого прохода.
+    # Threshold lowering and hard splitting apply only to the pieces that are
+    # still too long after the first pass.
     bounds = [0.0] + base + [float(duration)]
     for i in range(len(bounds) - 1):
         cuts += _segment_recursive(candidates, bounds[i], bounds[i + 1], 1, levels,
@@ -291,8 +294,8 @@ def detect_silence_timestamps(audio_path, duration, noise_tol='-30dB',
     cuts = sorted({c for c in cuts if 0 < c < duration})
     cuts = _enforce_min_segment(cuts, duration, min_segment)
 
-    logger.info(f"silencedetect: пауз-кандидатов — {len(candidates)}, "
-                f"уровни порога — {levels}, итоговых точек разреза — {len(cuts)}")
+    logger.info(f"silencedetect: pause candidates - {len(candidates)}, "
+                f"threshold levels - {levels}, resulting cut points - {len(cuts)}")
     return cuts
 
 
@@ -304,47 +307,47 @@ def download_audio(url):
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     temp_dir_path = tempfile.mkdtemp(prefix='ytpl_audio_')
     outtmpl = os.path.join(temp_dir_path, 'audio.%(ext)s')
-    
+
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': outtmpl,
         'quiet': False,
         'no_warnings': False,
-        'socket_timeout': 60,       # увеличенный таймаут сокета (было 20 по умолчанию)
-        'retries': 10,              # количество повторных попыток при ошибке загрузки
-        'fragment_retries': 10,     # повторные попытки для фрагментированных потоков
-        'http_chunk_size': 10485760, # 10 МБ чанки — помогают при нестабильном соединении
-        'js_runtimes': {'node': {}}, # использовать установленный Node.js для расшифровки ссылок YouTube (иначе троттлинг и таймауты)
+        'socket_timeout': 60,       # raised socket timeout (the default was 20)
+        'retries': 10,              # download retry attempts
+        'fragment_retries': 10,     # retries for fragmented streams
+        'http_chunk_size': 10485760, # 10 MB chunks - help on an unstable connection
+        'js_runtimes': {'node': {}}, # use the installed Node.js to decrypt YouTube URLs (otherwise throttling and timeouts)
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         title = info['title']
         description = info.get('description', '')
         duration = info['duration']
-        chapters = info.get('chapters')  # структурные главы YouTube, если заданы автором
+        chapters = info.get('chapters')  # structural YouTube chapters, if the author set them
         ext = info.get('ext', 'm4a')
-        
-        # Находим скачанный файл
+
+        # Locate the downloaded file
         downloaded_file = None
         for f in os.listdir(temp_dir_path):
             downloaded_file = os.path.join(temp_dir_path, f)
             break
-        
+
         if not downloaded_file or not os.path.exists(downloaded_file):
             raise FileNotFoundError("Audio file was not downloaded successfully")
-        
+
         if ext.lower() == 'mp3':
-            mp3_file = downloaded_file  # Уже MP3, используем как есть
+            mp3_file = downloaded_file  # already MP3, use as is
         else:
             mp3_file = os.path.join(temp_dir_path, 'audio.mp3')
             cmd = [ffmpeg_path, '-i', downloaded_file, '-q:a', '0', '-y', mp3_file]
             subprocess.run(cmd, check=True)
             if os.path.exists(downloaded_file):
                 os.remove(downloaded_file)
-    
+
     return mp3_file, title, description, duration, chapters, temp_dir_path
 
-def split_audio(audio_path, timestamps, duration, base_name='видео', output_dir='.'):
+def split_audio(audio_path, timestamps, duration, base_name='video', output_dir='.'):
     """
     Split audio into segments based on timestamps using ffmpeg.
     Returns list of created segment paths.
@@ -353,56 +356,56 @@ def split_audio(audio_path, timestamps, duration, base_name='видео', output
     segments = []
     created_files = []
     start = 0
-    
-    # Фильтруем и валидируем временные метки
+
+    # Filter and validate the timestamps
     valid_timestamps = []
     for ts in timestamps:
         if ts <= start:
-            logger.warning(f"Пропущена некорректная метка: {ts}s (должна быть > {start}s)")
+            logger.warning(f"Skipped invalid timestamp: {ts}s (must be > {start}s)")
             continue
         if ts > duration:
-            logger.warning(f"Пропущена метка за пределами видео: {ts}s (длительность: {duration}s)")
+            logger.warning(f"Skipped timestamp beyond the video: {ts}s (duration: {duration}s)")
             continue
         valid_timestamps.append(ts)
-    
+
     timestamps = valid_timestamps
-    
+
     for i, end in enumerate(timestamps):
         if end > start:
             segments.append((start, end))
             start = end
         else:
-            logger.warning(f"Пропущен перекрывающийся сегмент: {start}s - {end}s")
+            logger.warning(f"Skipped overlapping segment: {start}s - {end}s")
 
-    # Добавляем последний сегмент до конца видео
+    # Add the last segment, up to the end of the video
     if start < duration:
         segments.append((start, duration))
     elif start == duration and segments:
-        logger.info("Последняя метка совпадает с концом видео, последний сегмент не нужен")
+        logger.info("The last timestamp matches the end of the video, no final segment needed")
     elif not segments:
-        logger.warning("Нет валидных сегментов для создания")
+        logger.warning("No valid segments to create")
 
-    logger.info(f"Создание {len(segments)} сегментов")
-    
+    logger.info(f"Creating {len(segments)} segments")
+
     for i, (start_time, end_time) in enumerate(segments):
         segment_num = f"{i+1:04d}"
         output_filename = os.path.join(output_dir, f"{base_name}_{segment_num}.mp3")
         duration_seg = end_time - start_time
-        
-        logger.info(f"Сегмент {i+1}/{len(segments)}: {start_time}s - {end_time}s ({duration_seg:.1f}s)")
-        
+
+        logger.info(f"Segment {i+1}/{len(segments)}: {start_time}s - {end_time}s ({duration_seg:.1f}s)")
+
         cmd = [ffmpeg_path, '-i', audio_path, '-ss', str(start_time), '-t', str(duration_seg), '-c', 'copy', output_filename]
         result = subprocess.run(cmd, capture_output=True, text=True)
-        
+
         if result.returncode != 0:
-            logger.error(f"Ошибка при создании сегмента {i+1}: {result.stderr}")
+            logger.error(f"Failed to create segment {i+1}: {result.stderr}")
             continue
-        
+
         if os.path.exists(output_filename):
             created_files.append(output_filename)
-            logger.info(f"Создан: {output_filename}")
+            logger.info(f"Created: {output_filename}")
         else:
-            logger.error(f"Файл сегмента не был создан: {output_filename}")
+            logger.error(f"Segment file was not created: {output_filename}")
 
     return created_files
 
@@ -412,144 +415,147 @@ def process_youtube_video(url, manual_timestamps=None, mode=MODE_SILENCE,
     Main function to process YouTube video.
 
     Parameters:
-        manual_timestamps — строка вида '145,325'; если задана, режим всегда MODE_MANUAL.
-        mode              — MODE_SILENCE (по умолчанию), MODE_META или MODE_MANUAL.
-        silence_opts      — dict с параметрами detect_silence_timestamps.
+        manual_timestamps - a string like '145,325'; when given, the mode is always MODE_MANUAL.
+        mode              - MODE_SILENCE (the default), MODE_META or MODE_MANUAL.
+        silence_opts      - dict of detect_silence_timestamps parameters.
 
     Returns list of created segment paths.
     """
-    temp_dir_path = None  # Для хранения пути к временной директории
+    temp_dir_path = None  # holds the path to the temporary directory
 
     try:
-        # Download audio (получаем title, description, duration вместе с файлом)
-        logger.info("Загрузка аудио...")
+        # Download audio (title, description and duration come with the file)
+        logger.info("Downloading audio...")
         audio_path, title, description, duration, chapters, temp_dir_path = download_audio(url)
         print(f"Video title: {title}")
         print(f"Video duration: {duration}s")
 
-        # Источник точек реза задаётся режимом, а не наличием таймкодов у автора:
-        # главы и описание в приоритет НЕ попадают, потому что на миксах они
-        # обычно размечают блоки из нескольких треков. См. MODE_* выше.
+        # The source of cut points is decided by the mode, not by whether the
+        # author supplied timestamps: chapters and description are NOT given
+        # priority, because on mixes they usually mark blocks of several tracks.
+        # See MODE_* above.
         if manual_timestamps:
             mode = MODE_MANUAL
 
         if mode == MODE_MANUAL:
             timestamps = [int(t) for t in str(manual_timestamps).split(',')
                           if t.strip().isdigit()]
-            logger.info(f"Режим: ручные таймкоды — {timestamps}")
+            logger.info(f"Mode: manual timestamps - {timestamps}")
         elif mode == MODE_META:
-            logger.info("Режим: таймкоды из метаданных (запрошен принудительно).")
+            logger.info("Mode: timestamps from metadata (explicitly requested).")
             timestamps, source = timestamps_from_metadata(url, description, chapters)
-            logger.info(f"Источник: {source}; точек разреза — {len(timestamps)}: {timestamps}")
+            logger.info(f"Source: {source}; cut points - {len(timestamps)}: {timestamps}")
             if not timestamps:
-                logger.warning("В метаданных таймкодов нет — перехожу на анализ пауз.")
+                logger.warning("No timestamps in the metadata - falling back to silence analysis.")
                 timestamps = detect_silence_timestamps(audio_path, duration,
                                                        **(silence_opts or {}))
         else:
-            logger.info("Режим: анализ пауз в аудио (метаданные игнорируются).")
+            logger.info("Mode: silence analysis (metadata ignored).")
             timestamps = detect_silence_timestamps(audio_path, duration,
                                                    **(silence_opts or {}))
 
         if not timestamps:
-            logger.warning("Точек разреза не найдено — аудио останется одним файлом.")
+            logger.warning("No cut points found - the audio will stay a single file.")
             if sys.stdin is not None and sys.stdin.isatty():
-                cont = input("Сохранить одним файлом? (y/n): ").strip().lower()
-                if cont not in ('', 'y', 'yes', 'д', 'да'):
+                cont = input("Save as a single file? (y/n): ").strip().lower()
+                if cont not in ('', 'y', 'yes'):
                     return []
 
         # Split audio
         base_name = re.sub(r'[^\w\-_\. ]', '_', title).replace(' ', '_')
         output_dir = base_name
         os.makedirs(output_dir, exist_ok=True)
-        
-        logger.info("Разделение аудио на сегменты...")
+
+        logger.info("Splitting audio into segments...")
         created_segments = split_audio(audio_path, timestamps, duration, base_name, output_dir)
 
         print(f"\n{'='*50}")
-        print(f"Обработка завершена успешно!")
-        print(f"Создано сегментов: {len(created_segments)}")
-        print(f"Папка вывода: {output_dir}/")
+        print(f"Processing finished successfully!")
+        print(f"Segments created: {len(created_segments)}")
+        print(f"Output folder: {output_dir}/")
         print(f"{'='*50}")
-        
+
         return created_segments
 
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
+        logger.error(f"Error: {e}")
         raise
     finally:
-        # Очистка временных файлов
+        # Clean up the temporary files
         if temp_dir_path and os.path.exists(temp_dir_path):
             try:
                 import shutil
                 shutil.rmtree(temp_dir_path)
-                logger.info(f"Временные файлы удалены: {temp_dir_path}")
+                logger.info(f"Temporary files removed: {temp_dir_path}")
             except Exception as cleanup_error:
-                logger.warning(f"Не удалось удалить временные файлы: {cleanup_error}")
+                logger.warning(f"Could not remove the temporary files: {cleanup_error}")
 
 def build_parser():
     """
-    Разбор аргументов командной строки. Без аргументов скрипт спросит всё сам.
+    Command-line argument parsing. With no arguments the script asks for
+    everything itself.
     """
     p = argparse.ArgumentParser(
         prog='YTPL',
-        description='Скачивает аудио с YouTube и нарезает его на отдельные треки. '
-                    'По умолчанию режет по паузам в аудио; главы и таймкоды из '
-                    'описания берутся только с флагом --from-description.',
+        description='Downloads audio from YouTube and splits it into separate '
+                    'tracks. Splits by pauses in the audio by default; chapters '
+                    'and description timestamps are only used with '
+                    '--from-description.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument('url', nargs='?', help='ссылка на видео YouTube')
-    p.add_argument('-t', '--timestamps', metavar='СЕК',
-                   help="свои таймкоды в секундах через запятую, напр. '145,325'")
+    p.add_argument('url', nargs='?', help='YouTube video URL')
+    p.add_argument('-t', '--timestamps', metavar='SEC',
+                   help="your own timestamps in seconds, comma-separated, e.g. '145,325'")
     p.add_argument('-d', '--from-description', '--desc', '--chapters',
                    dest='from_description', action='store_true',
-                   help='принудительно взять таймкоды из глав/описания видео '
-                        'вместо анализа пауз')
+                   help='force timestamps from the video chapters/description '
+                        'instead of silence analysis')
     p.add_argument('--silence', dest='force_silence', action='store_true',
-                   help='явно выбрать анализ пауз (режим по умолчанию)')
+                   help='explicitly select silence analysis (the default mode)')
 
-    g = p.add_argument_group('настройка анализа пауз')
+    g = p.add_argument_group('silence analysis settings')
     g.add_argument('--noise', default='-30dB', metavar='dB',
-                   help='порог громкости, ниже которого звук считается тишиной; '
-                        'минус можно опустить: --noise 30dB или --noise=-30dB')
-    g.add_argument('--min-silence', type=float, default=1.5, metavar='СЕК',
-                   help='стартовый порог длины паузы')
-    g.add_argument('--floor', type=float, default=0.8, metavar='СЕК',
-                   help='минимальный порог длины паузы при понижении')
-    g.add_argument('--max-segment', type=float, default=300.0, metavar='СЕК',
-                   help='участок длиннее этого дорезается более низким порогом')
-    g.add_argument('--min-segment', type=float, default=15.0, metavar='СЕК',
-                   help='минимальная длина трека: короткие огрызки сливаются с соседом')
+                   help='volume threshold below which sound counts as silence; '
+                        'the minus sign may be omitted: --noise 30dB or --noise=-30dB')
+    g.add_argument('--min-silence', type=float, default=1.5, metavar='SEC',
+                   help='starting pause-length threshold')
+    g.add_argument('--floor', type=float, default=0.8, metavar='SEC',
+                   help='lowest pause-length threshold when lowering')
+    g.add_argument('--max-segment', type=float, default=300.0, metavar='SEC',
+                   help='a piece longer than this is re-split with a lower threshold')
+    g.add_argument('--min-segment', type=float, default=15.0, metavar='SEC',
+                   help='minimum track length: short stubs are merged into the neighbour')
     return p
 
 
 def prompt_mode():
     """
-    Интерактивный выбор режима. Enter — анализ пауз (режим по умолчанию).
+    Interactive mode selection. Enter - silence analysis (the default mode).
     Returns (mode, manual_timestamps).
     """
     print()
-    print("Режим нарезки:")
-    print("  [Enter] — по паузам в аудио (по умолчанию: подходит для миксов и альбомов)")
-    print("  d       — по главам/таймкодам из описания видео")
-    print("  145,325 — свои таймкоды в секундах через запятую")
-    choice = input("Выбор: ").strip()
+    print("Splitting mode:")
+    print("  [Enter] - by pauses in the audio (default: works for mixes and albums)")
+    print("  d       - by the video's chapters/description timestamps")
+    print("  145,325 - your own timestamps in seconds, comma-separated")
+    choice = input("Choice: ").strip()
     if not choice:
         return MODE_SILENCE, None
-    if choice.lower() in ('d', 'в', 'desc', 'описание', 'главы'):
+    if choice.lower() in ('d', 'desc', 'description', 'chapters'):
         return MODE_META, None
     return MODE_MANUAL, choice
 
 
 def resolve_mode(args, interactive=None):
     """
-    Определяет режим нарезки по аргументам командной строки.
+    Work out the splitting mode from the command-line arguments.
 
-    Приоритет: свои таймкоды -> принудительные метаданные -> режим по умолчанию.
-    Если ссылку передали аргументом и флагов нет, работаем молча в режиме по
-    умолчанию; без аргументов вообще — спрашиваем режим у пользователя.
+    Priority: own timestamps -> forced metadata -> the default mode. When a URL
+    is passed as an argument and no flags are given, run quietly in the default
+    mode; with no arguments at all, ask the user for the mode.
 
     Parameters:
-        interactive — переопределяет автоопределение интерактивного запуска
-                      (по умолчанию: подключён ли stdin к терминалу).
+        interactive - overrides the automatic detection of an interactive run
+                      (by default: whether stdin is attached to a terminal).
 
     Returns:
         (mode, manual_timestamps).
@@ -569,11 +575,11 @@ def resolve_mode(args, interactive=None):
 
 def normalize_noise(value):
     """
-    Приводит порог громкости к виду, понятному ffmpeg ('-30dB').
+    Bring the volume threshold into the form ffmpeg understands ('-30dB').
 
-    argparse не принимает запись '--noise -30dB': значение с минуса читается
-    как очередной флаг. Поэтому допускаем и форму без минуса ('--noise 30dB'),
-    приводя её к отрицательному значению.
+    argparse rejects '--noise -30dB': a value starting with a minus is read as
+    another flag. So the form without the minus ('--noise 30dB') is accepted too
+    and turned into a negative value.
     """
     value = str(value).strip()
     if not value:
@@ -585,7 +591,7 @@ def normalize_noise(value):
 
 def silence_opts_from_args(args):
     """
-    Собирает параметры анализа пауз из аргументов командной строки.
+    Collect the silence analysis parameters from the command-line arguments.
     """
     return {
         'noise_tol': normalize_noise(args.noise),
@@ -599,23 +605,23 @@ def silence_opts_from_args(args):
 if __name__ == "__main__":
     args = build_parser().parse_args()
 
-    # Проверка наличия ffmpeg
+    # Check that ffmpeg is available
     try:
         ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
         if not os.path.exists(ffmpeg_path):
-            raise RuntimeError(f"FFmpeg не найден по пути: {ffmpeg_path}")
-        logger.info(f"FFmpeg найден: {ffmpeg_path}")
+            raise RuntimeError(f"FFmpeg not found at: {ffmpeg_path}")
+        logger.info(f"FFmpeg found: {ffmpeg_path}")
     except Exception as e:
-        logger.error(f"FFmpeg не найден. Установите imageio-ffmpeg: pip install imageio-ffmpeg")
+        logger.error(f"FFmpeg not found. Install imageio-ffmpeg: pip install imageio-ffmpeg")
         exit(1)
 
-    url = args.url or input("Ссылка на видео YouTube: ").strip()
+    url = args.url or input("Enter YouTube video URL: ").strip()
     if not url:
-        logger.error("Ссылка не указана.")
+        logger.error("No URL given.")
         exit(1)
 
-    # Режим: флаги важнее всего, затем — интерактивный вопрос. Если ссылку
-    # передали аргументом и флагов нет, работаем молча в режиме по умолчанию.
+    # Mode: flags come first, then the interactive question. When a URL is passed
+    # as an argument and no flags are given, run quietly in the default mode.
     mode, manual_timestamps = resolve_mode(args)
     silence_opts = silence_opts_from_args(args)
 
@@ -623,12 +629,12 @@ if __name__ == "__main__":
         process_youtube_video(url, manual_timestamps, mode=mode,
                               silence_opts=silence_opts)
     except KeyboardInterrupt:
-        logger.info("\nОперация отменена пользователем")
+        logger.info("\nOperation cancelled by the user")
     except Exception as e:
-        logger.error(f"Произошла ошибка: {e}")
-        print(f"\n[ОШИБКА] {e}")
-        print("Возможные решения:")
-        print("  1. Проверьте подключение к интернету")
-        print("  2. Обновите yt-dlp: pip install -U yt-dlp")
-        print("  3. Обновите imageio-ffmpeg: pip install -U imageio-ffmpeg")
-        print("  4. Попробуйте другую ссылку на YouTube")
+        logger.error(f"An error occurred: {e}")
+        print(f"\n[ERROR] {e}")
+        print("Possible fixes:")
+        print("  1. Check your internet connection")
+        print("  2. Update yt-dlp: pip install -U yt-dlp")
+        print("  3. Update imageio-ffmpeg: pip install -U imageio-ffmpeg")
+        print("  4. Try a different YouTube link")

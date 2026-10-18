@@ -1,8 +1,8 @@
 """
-Анализ пауз: detect_silence_timestamps и вспомогательные функции.
+Silence analysis: detect_silence_timestamps and its helpers.
 
-Тесты работают на реальном ffmpeg и сгенерированном локально аудио, поэтому
-проверяют весь путь: silencedetect -> отбор кандидатов -> рекурсия по порогам.
+These tests run against the real ffmpeg and locally generated audio, so they
+cover the whole path: silencedetect -> candidate selection -> threshold recursion.
 """
 import pytest
 
@@ -10,12 +10,12 @@ import YTPL
 
 
 def test_enforce_min_segment_drops_short_pieces():
-    # Резы на 10 и 12 с дают огрызки короче 15 с: остаётся только первый.
+    # Cuts at 10 s and 12 s leave stubs shorter than 15 s: only the last survives.
     assert YTPL._enforce_min_segment([10.0, 12.0, 40.0], total=100.0, min_seg=15.0) == [40.0]
 
 
 def test_enforce_min_segment_drops_short_tail():
-    # Последний сегмент (100 - 95 = 5 с) слишком короткий — рез отбрасывается.
+    # The last segment (100 - 95 = 5 s) is too short, so that cut is discarded.
     assert YTPL._enforce_min_segment([30.0, 95.0], total=100.0, min_seg=15.0) == [30.0]
 
 
@@ -29,8 +29,8 @@ def test_enforce_min_segment_without_cuts():
 
 def test_short_album_is_split_by_gaps(album_audio):
     """
-    Главная проверка короткого аудио: 124 с — меньше max_segment_len (300 с),
-    но паузы между треками явные, значит резать всё равно нужно.
+    The key check for short audio: 124 s is less than max_segment_len (300 s),
+    but the pauses between tracks are obvious, so it still has to be split.
     """
     path, duration = album_audio
     cuts = YTPL.detect_silence_timestamps(path, duration)
@@ -42,8 +42,8 @@ def test_short_album_is_split_by_gaps(album_audio):
 
 def test_cuts_land_in_the_middle_of_a_gap(album_audio):
     """
-    Рез должен попадать внутрь паузы, а не в звучащий фрагмент: иначе у трека
-    отрезается конец или к нему прилипает начало следующего.
+    A cut must fall inside the pause rather than into an audible piece,
+    otherwise a track loses its ending or picks up the start of the next one.
     """
     path, duration = album_audio
     cuts = YTPL.detect_silence_timestamps(path, duration)
@@ -63,21 +63,21 @@ def test_no_cuts_outside_duration(album_audio):
 
 def test_min_segment_merges_tiny_tracks(album_audio):
     """
-    При min_segment больше длины трека лишние резы исчезают: ни один рез не
-    даёт двух сегментов по 60 с (треки всего по 40 с), поэтому файл остаётся
-    целым — вместо набора огрызков.
+    With min_segment above the track length the extra cuts disappear: no cut
+    yields two 60 s segments (the tracks are only 40 s), so the file is left
+    whole instead of becoming a pile of stubs.
     """
     path, duration = album_audio
 
     assert YTPL.detect_silence_timestamps(path, duration, min_segment=60.0) == []
-    # Контроль: с порогом по умолчанию резы на этом же файле есть.
+    # Control: with the default threshold this very file does get cut.
     assert len(YTPL.detect_silence_timestamps(path, duration)) == 2
 
 
 def test_gapless_audio_is_hard_split(gapless_audio):
     """
-    700 с без пауз: ни один порог не срабатывает, поэтому участок режется
-    жёстко на равные части не длиннее max_segment_len.
+    700 s without pauses: no threshold fires, so the piece is split hard into
+    equal parts no longer than max_segment_len.
     """
     path, duration = gapless_audio
     cuts = YTPL.detect_silence_timestamps(path, duration, max_segment_len=300.0)
@@ -85,16 +85,17 @@ def test_gapless_audio_is_hard_split(gapless_audio):
     bounds = [0.0] + cuts + [duration]
     lengths = [b - a for a, b in zip(bounds, bounds[1:])]
 
-    assert len(cuts) == 2  # ceil(700 / 300) = 3 части
+    assert len(cuts) == 2  # ceil(700 / 300) = 3 parts
     assert max(lengths) <= 300.0 + 1e-6
-    assert max(lengths) - min(lengths) < 1e-6  # части равной длины
+    assert max(lengths) - min(lengths) < 1e-6  # parts of equal length
 
 
 def test_threshold_is_lowered_only_for_long_segments(mixed_audio):
     """
-    Пауза 1.0 с короче стартового порога (1.5 с), поэтому на первом проходе
-    видна только пауза 2.0 с. Остаток длиной ~201 с не превышает
-    max_segment_len=300, значит порог не понижается и короткая пауза не режется.
+    The 1.0 s pause is shorter than the starting threshold (1.5 s), so only the
+    2.0 s pause shows up in the first pass. The remaining ~201 s piece does not
+    exceed max_segment_len=300, so the threshold is never lowered and the short
+    pause is not cut.
     """
     path, duration = mixed_audio
     cuts = YTPL.detect_silence_timestamps(path, duration, max_segment_len=300.0)
@@ -105,9 +106,9 @@ def test_threshold_is_lowered_only_for_long_segments(mixed_audio):
 
 def test_long_segment_triggers_lower_threshold(mixed_audio):
     """
-    Тот же файл с max_segment_len=150: участок до длинной паузы (~201 с)
-    считается слишком длинным, порог понижается до 0.8 с и короткая пауза
-    (1.0 с) тоже становится точкой реза.
+    The same file with max_segment_len=150: the piece before the long pause
+    (~201 s) counts as too long, the threshold drops to 0.8 s and the short
+    pause (1.0 s) becomes a cut point as well.
     """
     path, duration = mixed_audio
     cuts = YTPL.detect_silence_timestamps(path, duration, max_segment_len=150.0)
@@ -119,8 +120,8 @@ def test_long_segment_triggers_lower_threshold(mixed_audio):
 
 def test_strict_noise_threshold_still_finds_real_gaps(album_audio):
     """
-    Паузы между треками — цифровая тишина, поэтому они определяются даже при
-    очень строгом пороге громкости (-90 dB).
+    The pauses between tracks are digital silence, so they are detected even
+    with a very strict volume threshold (-90 dB).
     """
     path, duration = album_audio
     cuts = YTPL.detect_silence_timestamps(path, duration, noise_tol='-90dB')
@@ -130,8 +131,8 @@ def test_strict_noise_threshold_still_finds_real_gaps(album_audio):
 
 def test_returns_empty_list_when_nothing_to_cut(gapless_audio):
     """
-    Пауз нет, а жёсткий рез не нужен (участок короче max_segment_len):
-    функция обязана вернуть пустой список, а не падать.
+    No pauses, and no hard split needed (the piece is shorter than
+    max_segment_len): the function must return an empty list rather than fail.
     """
     path, duration = gapless_audio
     assert YTPL.detect_silence_timestamps(path, duration,
@@ -140,8 +141,8 @@ def test_returns_empty_list_when_nothing_to_cut(gapless_audio):
 
 def test_min_silence_below_floor_still_works(album_audio):
     """
-    Вырожденная настройка: стартовый порог ниже floor. Список уровней
-    сводится к одному значению, функция не должна падать.
+    A degenerate setting: the starting threshold is below floor. The level list
+    collapses to a single value and the function must not fail.
     """
     path, duration = album_audio
     cuts = YTPL.detect_silence_timestamps(path, duration, min_silence_dur=0.5, floor=0.8)

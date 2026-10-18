@@ -2,5 +2,5 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
-# Результат работы скрипта: папки с нарезанными треками
+# Output of the script: folders with the split tracks
 *.mp3

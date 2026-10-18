@@ -1,5 +1,6 @@
 @echo off
-:: UTF-8 в консоли: иначе русские сообщения скрипта выводятся кракозябрами
+:: UTF-8 console code page: video titles with non-ASCII characters
+:: would otherwise fail to print on Windows
 chcp 65001 >nul
 title YTPL - YouTube Playlist Converter
 
@@ -17,8 +18,8 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-:: Run the script (аргументы командной строки прокидываются как есть,
-:: напр. YTPL.bat <ссылка> --from-description)
+:: Run the script (command-line arguments are forwarded as they are,
+:: e.g. YTPL.bat <url> --from-description)
 python "%~dp0YTPL.py" %*
 set EXITCODE=%errorlevel%
 

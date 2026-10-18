@@ -1,10 +1,10 @@
 """
-Выбор режима нарезки.
+Splitting mode selection.
 
-Ключевое поведение: по умолчанию режем по паузам, а главы и описание видео
-используются только принудительно (--from-description). Проверяется и на уровне
-аргументов командной строки (resolve_mode), и на уровне обработки видео
-(process_youtube_video).
+The key behaviour: pauses are the default, while chapters and the video
+description are only used when explicitly requested (--from-description). This
+is checked both at the command-line level (resolve_mode) and at the processing
+level (process_youtube_video).
 """
 import pytest
 
@@ -14,7 +14,7 @@ from conftest import EXAMPLE_CHAPTERS
 CHAPTER_CUTS = [930.0, 2085.0, 3130.0, 4200.0]
 
 
-# --- resolve_mode: разбор аргументов ---------------------------------------
+# --- resolve_mode: argument handling ---------------------------------------
 
 def test_default_mode_is_silence(args_factory):
     args = args_factory(url=True)
@@ -49,8 +49,9 @@ def test_silence_flag_is_explicit_default(args_factory):
 @pytest.mark.parametrize('answer, expected', [
     ('', (YTPL.MODE_SILENCE, None)),
     ('d', (YTPL.MODE_META, None)),
-    ('в', (YTPL.MODE_META, None)),          # та же клавиша в русской раскладке
-    ('описание', (YTPL.MODE_META, None)),
+    ('D', (YTPL.MODE_META, None)),
+    ('description', (YTPL.MODE_META, None)),
+    ('chapters', (YTPL.MODE_META, None)),
     ('145,325', (YTPL.MODE_MANUAL, '145,325')),
 ])
 def test_interactive_prompt(monkeypatch, args_factory, answer, expected):
@@ -92,8 +93,8 @@ def test_silence_opts_from_args():
 
 @pytest.mark.parametrize('given, expected', [
     ('-30dB', '-30dB'),
-    ('30dB', '-30dB'),      # argparse не пропускает '--noise -30dB', поэтому
-    ('+30dB', '-30dB'),     # допускается запись без минуса
+    ('30dB', '-30dB'),      # argparse rejects '--noise -30dB', so a value
+    ('+30dB', '-30dB'),     # without the minus sign is accepted too
     ('  25dB  ', '-25dB'),
     ('', '-30dB'),
 ])
@@ -106,12 +107,12 @@ def test_noise_without_minus_is_accepted_by_cli():
     assert YTPL.silence_opts_from_args(args)['noise_tol'] == '-25dB'
 
 
-# --- process_youtube_video: какой источник резов реально используется ------
+# --- process_youtube_video: which source of cuts is actually used ----------
 
 def test_default_ignores_chapters(fake_download, album_audio):
     """
-    Главный сценарий: у видео есть главы, но они размечают блоки из нескольких
-    треков. По умолчанию они должны игнорироваться в пользу анализа пауз.
+    The main scenario: the video has chapters, but they mark blocks of several
+    tracks. By default they must be ignored in favour of silence analysis.
     """
     path, duration = album_audio
     state = fake_download(path, duration, chapters=EXAMPLE_CHAPTERS)
@@ -142,11 +143,11 @@ def test_meta_mode_uses_chapters(fake_download, album_audio):
 
 def test_meta_mode_falls_back_to_silence(fake_download, album_audio, monkeypatch):
     """
-    Режим метаданных запрошен, но таймкодов в них нет: вместо отказа
-    переходим на анализ пауз.
+    Metadata mode was requested but holds no timestamps: instead of giving up,
+    fall back to silence analysis.
     """
     path, duration = album_audio
-    state = fake_download(path, duration, description='без таймкодов', chapters=None)
+    state = fake_download(path, duration, description='no timestamps', chapters=None)
     monkeypatch.setattr(YTPL, 'get_full_page_text', lambda url: '')
 
     YTPL.process_youtube_video('https://example.invalid', mode=YTPL.MODE_META)
@@ -156,8 +157,8 @@ def test_meta_mode_falls_back_to_silence(fake_download, album_audio, monkeypatch
 
 def test_manual_timestamps_override_mode(fake_download, album_audio):
     """
-    Переданные вручную таймкоды важнее любого режима — в том числе
-    принудительного режима метаданных.
+    Timestamps passed by hand outweigh any mode - the forced metadata mode
+    included.
     """
     path, duration = album_audio
     state = fake_download(path, duration, chapters=EXAMPLE_CHAPTERS)
@@ -179,9 +180,9 @@ def test_manual_timestamps_ignore_garbage(fake_download, album_audio):
 
 def test_silence_opts_are_passed_through(fake_download, album_audio):
     """
-    max_segment_len=20 заставляет дорезать каждый 40-секундный трек, поэтому
-    резов становится заметно больше двух: значит параметры режима действительно
-    доходят до detect_silence_timestamps.
+    max_segment_len=20 forces every 40 s track to be re-split, so there end up
+    being noticeably more than two cuts: the mode parameters really do reach
+    detect_silence_timestamps.
     """
     path, duration = album_audio
     state = fake_download(path, duration, chapters=EXAMPLE_CHAPTERS)
@@ -205,14 +206,14 @@ def test_output_dir_is_sanitized(fake_download, album_audio):
 
 def test_no_cuts_keeps_single_file_without_prompt(fake_download, album_audio, monkeypatch):
     """
-    Резов нет и запуск неинтерактивный: скрипт не должен зависать на input(),
-    а обязан сохранить аудио одним файлом.
+    No cuts and a non-interactive run: the script must not hang on input(),
+    it has to save the audio as a single file.
     """
     path, duration = album_audio
     state = fake_download(path, duration)
     monkeypatch.setattr(YTPL, 'detect_silence_timestamps',
                         lambda *a, **k: [])
-    monkeypatch.setattr('builtins.input', lambda *a: pytest.fail('лишний input()'))
+    monkeypatch.setattr('builtins.input', lambda *a: pytest.fail('unexpected input()'))
     monkeypatch.setattr(YTPL.sys, 'stdin', None)
 
     result = YTPL.process_youtube_video('https://example.invalid')

@@ -1,5 +1,5 @@
 """
-Нарезка аудио: валидация меток и реальная резка файла через ffmpeg.
+Audio splitting: timestamp validation and real cutting with ffmpeg.
 """
 import os
 import subprocess
@@ -12,7 +12,7 @@ import YTPL
 
 def _duration(path):
     """
-    Длительность файла по данным ffmpeg (читаем stderr, как и сам YTPL).
+    File duration according to ffmpeg (read from stderr, as YTPL itself does).
     """
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     result = subprocess.run([ffmpeg, '-i', path, '-f', 'null', '-'],
@@ -57,7 +57,7 @@ def test_timestamps_beyond_duration_are_skipped(album_mp3, tmp_path):
     created = YTPL.split_audio(path, [41.0, duration + 500], duration,
                                base_name='album', output_dir=str(tmp_path))
 
-    # Метка за пределами видео отбрасывается: остаётся рез на 41 с.
+    # The timestamp past the end of the video is dropped: the 41 s cut remains.
     assert len(created) == 2
 
 

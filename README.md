@@ -5,8 +5,8 @@ separate tracks.
 
 **By default it splits by silence gaps in the audio and ignores the video's
 chapters and description.** The reason: on mixes and compilations, author
-timestamps usually mark large blocks rather than individual tracks — a
-108-minute mix with five "Sector I…V" chapters would be cut into five 20-minute
+timestamps usually mark large blocks rather than individual tracks - a
+108-minute mix with five "Sector I-V" chapters would be cut into five 20-minute
 files, each containing several tracks. Metadata is used only when you ask for it
 explicitly with `--from-description`.
 
@@ -35,9 +35,9 @@ explicitly with `--from-description`.
 - requests
 - beautifulsoup4
 - imageio-ffmpeg (includes ffmpeg)
-- Node.js — recommended: yt-dlp uses it to decrypt YouTube URLs, otherwise
+- Node.js - recommended: yt-dlp uses it to decrypt YouTube URLs, otherwise
   downloads are throttled and time out
-- pytest — only to run the tests
+- pytest - only to run the tests
 
 ## Installation
 
@@ -86,10 +86,10 @@ python YTPL.py "https://youtu.be/VIDEO_ID" -t 0,185,420,735
 
 ## Mode priority
 
-1. `--timestamps` — your own values; they override everything.
-2. `--from-description` — chapters → description → page HTML. If there are no
+1. `--timestamps` - your own values; they override everything.
+2. `--from-description` - chapters -> description -> page HTML. If there are no
    timestamps there, falls back to silence analysis.
-3. Default — silence analysis; metadata is not read at all.
+3. Default - silence analysis; metadata is not read at all.
 
 ## Output
 
@@ -127,9 +127,10 @@ merging), mode selection and the actual ffmpeg splitting.
 - **Command-line interface**: URL and mode can be passed as arguments, so the
   script can run non-interactively; `YTPL.bat` forwards its arguments
 - **Fixed: audio shorter than `--max-segment` (5 minutes) was not split at all,
-  even with obvious gaps between tracks** — the first pass at the starting
+  even with obvious gaps between tracks** - the first pass at the starting
   threshold now always runs
 - `--noise` accepts a value without the minus sign (argparse would otherwise
   read `-30dB` as a flag)
 - pytest test suite
-- UTF-8 console code page in `YTPL.bat` (readable log messages)
+- UTF-8 console code page in `YTPL.bat`, so video titles with non-ASCII
+  characters print correctly on Windows

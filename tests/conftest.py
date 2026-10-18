@@ -1,8 +1,9 @@
 """
-Общие фикстуры для тестов YTPL.
+Shared fixtures for the YTPL tests.
 
-Тесты не обращаются к сети: загрузка с YouTube подменяется, а аудио для
-проверки анализа пауз генерируется локально через ffmpeg (из imageio-ffmpeg).
+The tests never touch the network: the YouTube download is stubbed, and the
+audio used to exercise the silence analysis is generated locally with ffmpeg
+(from imageio-ffmpeg).
 """
 import os
 import subprocess
@@ -14,12 +15,12 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import YTPL  # noqa: E402  (нужен sys.path выше)
+import YTPL  # noqa: E402  (needs the sys.path line above)
 
 
-# Главы видео-примера из README: 5 «секторов» на 108 минут, то есть внутри
-# каждой главы несколько треков — ровно тот случай, ради которого режим по
-# умолчанию игнорирует метаданные.
+# Chapters of the example video from the README: five "sectors" over 108
+# minutes, so every chapter holds several tracks - exactly the case the default
+# mode ignores metadata for.
 EXAMPLE_CHAPTERS = [
     {'start_time': 0, 'title': 'Sector I - Press Start (Intro)', 'end_time': 930},
     {'start_time': 930, 'title': 'Sector II - Neon City Streets', 'end_time': 2085},
@@ -47,13 +48,13 @@ def ffmpeg():
 @pytest.fixture(scope='session')
 def make_audio(ffmpeg, tmp_path_factory):
     """
-    Фабрика тестового аудио. Принимает список элементов:
-        ('tone', длительность, частота) — звучащий фрагмент,
-        ('silence', длительность)       — тишина.
+    Test-audio factory. Takes a list of pieces:
+        ('tone', duration, frequency) - an audible piece,
+        ('silence', duration)         - silence.
 
-    Возвращает (путь к wav, общая длительность в секундах).
-    Частота дискретизации нарочно низкая (8 кГц, моно) — файлы мелкие,
-    а silencedetect работает так же.
+    Returns (path to the wav, total duration in seconds).
+    The sample rate is deliberately low (8 kHz mono): the files stay small and
+    silencedetect behaves the same.
     """
     cache = {}
     base = tmp_path_factory.mktemp('audio')
@@ -96,10 +97,10 @@ def make_audio(ffmpeg, tmp_path_factory):
 @pytest.fixture(scope='session')
 def album_audio(make_audio):
     """
-    «Альбом»: 3 трека по 40 с, между ними паузы по 2 с. Общая длина 124 с —
-    короче max_segment_len (300 с), поэтому проверяет, что первый проход по
-    паузам выполняется независимо от длины участка.
-    Ожидаемые точки реза: середины пауз, то есть ~41 и ~83 с.
+    An "album": three 40 s tracks with 2 s pauses between them. The total of
+    124 s is shorter than max_segment_len (300 s), which is what makes this
+    check that the first pass over the pauses runs regardless of piece length.
+    Expected cut points: the pause midpoints, i.e. around 41 s and 83 s.
     """
     return make_audio([
         ('tone', 40, 440),
@@ -113,9 +114,9 @@ def album_audio(make_audio):
 @pytest.fixture(scope='session')
 def album_mp3(ffmpeg, album_audio, tmp_path_factory):
     """
-    Тот же «альбом», но в mp3: split_audio режет без перекодирования (-c copy),
-    поэтому на вход ему нужен именно mp3 — как и в реальной работе, где
-    download_audio всегда отдаёт mp3.
+    The same "album" as mp3: split_audio cuts without re-encoding (-c copy), so
+    it needs mp3 input - just like in real use, where download_audio always
+    hands over an mp3.
     """
     path, duration = album_audio
     out = tmp_path_factory.mktemp('mp3') / 'album.mp3'
@@ -128,8 +129,8 @@ def album_mp3(ffmpeg, album_audio, tmp_path_factory):
 @pytest.fixture(scope='session')
 def gapless_audio(make_audio):
     """
-    Непрерывные 700 с без единой паузы: ни один порог тишины не поможет,
-    поэтому ожидаем жёсткий рез по max_segment_len.
+    700 continuous seconds without a single pause: no silence threshold can
+    help, so a hard split by max_segment_len is expected.
     """
     return make_audio([('tone', 700, 440)], 'gapless')
 
@@ -137,10 +138,11 @@ def gapless_audio(make_audio):
 @pytest.fixture(scope='session')
 def mixed_audio(make_audio):
     """
-    Аудио с паузами разной длины: 1.0 с (ниже стартового порога 1.5 с) и 2.0 с.
-    На стартовом пороге виден только длинный разрыв; короткий подхватывается
-    лишь при понижении порога для слишком длинных участков.
-    Раскладка: 100с | 1с | 100с | 2с | 100с  (итого 303 с).
+    Audio with pauses of different lengths: 1.0 s (below the 1.5 s starting
+    threshold) and 2.0 s. Only the long gap is visible at the starting
+    threshold; the short one is picked up when the threshold is lowered for
+    pieces that are too long.
+    Layout: 100s | 1s | 100s | 2s | 100s  (303 s in total).
     """
     return make_audio([
         ('tone', 100, 440),
@@ -154,9 +156,9 @@ def mixed_audio(make_audio):
 @pytest.fixture
 def fake_download(monkeypatch):
     """
-    Подменяет download_audio и split_audio: процесс обработки прогоняется без
-    сети и без записи файлов. Возвращает функцию-настройку, после вызова
-    которой в её атрибуте `.cuts` оказываются точки реза, переданные в нарезку.
+    Stubs download_audio and split_audio so the processing runs without the
+    network and without writing files. Returns a setup function; after calling
+    it, its `.cuts` attribute holds the cut points handed to the splitter.
     """
     state = types.SimpleNamespace(cuts=None, base_name=None, output_dir=None)
 
@@ -174,9 +176,9 @@ def fake_download(monkeypatch):
         monkeypatch.setattr(YTPL, 'download_audio', _download)
         monkeypatch.setattr(YTPL, 'split_audio', _split)
         monkeypatch.setattr(YTPL.os, 'makedirs', lambda *a, **k: None)
-        # Страховка: в тестах метаданные не должны тянуться из сети.
+        # Safety net: metadata must never be fetched over the network in tests.
         monkeypatch.setattr(YTPL, 'get_full_page_text',
-                            lambda url: pytest.fail('сетевой запрос в тесте'))
+                            lambda url: pytest.fail('network request in a test'))
         return state
 
     setup.state = state
@@ -186,7 +188,7 @@ def fake_download(monkeypatch):
 @pytest.fixture
 def args_factory():
     """
-    Собирает объект аргументов так, как его вернул бы argparse.
+    Builds an arguments object the way argparse would return it.
     """
     def _make(**overrides):
         parser = YTPL.build_parser()
