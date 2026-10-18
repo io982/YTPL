@@ -1,0 +1,20 @@
+# Runtime dependencies. Install with:
+#     pip install -r requirements.txt
+#
+# Node.js is needed as well, and is not a Python package:
+#     https://nodejs.org
+
+# A 2026.07 yt-dlp returned HTTP 403 on every YouTube download; 2026.08.19
+# downloads normally, so the floor is deliberate rather than cosmetic.
+yt-dlp>=2026.8.19
+
+# Solves YouTube's JS challenge. Without it yt-dlp reports
+# 'n challenge solving failed' and the media URLs answer 403.
+yt-dlp-ejs>=0.8.0
+
+# Bundles the ffmpeg binary used for silence detection and splitting.
+imageio-ffmpeg
+
+# Used to scrape the video page when timestamps are taken from metadata.
+requests
+beautifulsoup4

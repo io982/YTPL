@@ -66,13 +66,17 @@ explicitly with `--from-description`.
   downloads are throttled and time out
 - yt-dlp-ejs - YouTube's JS challenge solver; without it downloads fail with
   HTTP 403
+- yt-dlp 2026.8.19 or newer - 2026.07 answered 403 on every download
 - pytest - only to run the tests
 
 ## Installation
 
 ```bash
-pip install yt-dlp requests beautifulsoup4 imageio-ffmpeg
+pip install -r requirements.txt
 ```
+
+Node.js is needed too and is not a Python package: get it from
+<https://nodejs.org>. For the tests, `pip install -r requirements-dev.txt`.
 
 ## Usage
 
@@ -213,24 +217,33 @@ merging), mode selection and the actual ffmpeg splitting.
 
 ## When every download fails with HTTP 403
 
-YouTube requires its JS challenge (the `n` challenge) to be solved, or the media
-URLs answer 403 on every track. That takes two things: **Node.js** and a
-**solver script**. Node alone is not enough - without the solver the log shows
+This was seen for real: a 426-track playlist run where every single track
+answered `HTTP Error 403: Forbidden`. Two separate things were missing, and
+both had to be fixed.
+
+**1. The JS challenge solver.** YouTube requires its `n` challenge to be
+solved, which needs Node.js *and* a solver script. Node alone is not enough;
+without the script the log shows
 
 ```
 n challenge solving failed: Some formats may be missing.
 ```
 
-The solver installs as an ordinary package:
+**2. A current yt-dlp.** With the solver installed the challenge warning went
+away, but 403 persisted on yt-dlp 2026.07.04. The same track downloaded
+normally on 2026.08.19, so `requirements.txt` sets that as the floor.
+
+Both are covered by
 
 ```bash
-pip install yt-dlp-ejs
+pip install -r requirements.txt --upgrade
 ```
 
-The alternative is to let yt-dlp fetch one at run time with
-`--remote-components ejs:github`. That downloads and runs code from an external
-source while the program works, so it is off by default. The solver is checked
-for at startup, and its absence is warned about in the log right away.
+The solver's presence is checked at startup and reported in the log, and every
+403 is answered with what to install, so neither has to be guessed at again.
+Instead of installing the solver, yt-dlp can be allowed to fetch one at run
+time with `--remote-components ejs:github`; that downloads and runs code from
+an external source while the program works, so it is off by default.
 
 ## Error Handling
 
@@ -263,6 +276,15 @@ for at startup, and its absence is warned about in the log right away.
 - **Fixed: a wedged `node --version` could hang the whole run.** Node is probed
   once with a timeout, and the run carries on without the runtime if it does
   not answer
+- **No more prompt when there is nothing to cut.** A track without internal
+  pauses is the normal case for a single song, the audio is already downloaded
+  by then, and the question crashed a run whose stdin was at EOF (never mind
+  asking it 426 times during a playlist)
+- **Fixed: every failed download leaked its temporary folder** - the caller
+  never received the path, so nothing cleaned it up. One failed playlist run
+  had left 134 of them behind
+- **`requirements.txt` / `requirements-dev.txt`** instead of a pip line in the
+  README
 
 - **Silence analysis is now the default; chapters and description are used only
   with `--from-description`**

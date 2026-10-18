@@ -562,6 +562,8 @@ def download_audio(url, verbose=None, remote_components=None):
         logger.debug("Download traceback", exc_info=True)
         if '403' in str(e):
             logger.error(HTTP_403_HINT)
+        # The caller never received the path, so it cannot clean this up.
+        shutil.rmtree(temp_dir_path, ignore_errors=True)
         raise
 
     title = info['title']
@@ -709,11 +711,8 @@ def process_youtube_video(url, manual_timestamps=None, mode=MODE_SILENCE,
                                                    **(silence_opts or {}))
 
         if not timestamps:
-            logger.warning("No cut points found - the audio will stay a single file.")
-            if sys.stdin is not None and sys.stdin.isatty():
-                cont = input("Save as a single file? (y/n): ").strip().lower()
-                if cont not in ('', 'y', 'yes'):
-                    return []
+            # Normal for a single song: nothing to split, so keep it whole.
+            logger.info("No cut points found - keeping the audio as a single file.")
 
         # Split audio
         base_name = output_name or sanitize_name(title)
