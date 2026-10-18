@@ -1,4 +1,6 @@
 @echo off
+:: UTF-8 в консоли: иначе русские сообщения скрипта выводятся кракозябрами
+chcp 65001 >nul
 title YTPL - YouTube Playlist Converter
 
 echo ==========================================
@@ -15,8 +17,9 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-:: Run the script
-python "%~dp0YTPL.py"
+:: Run the script (аргументы командной строки прокидываются как есть,
+:: напр. YTPL.bat <ссылка> --from-description)
+python "%~dp0YTPL.py" %*
 set EXITCODE=%errorlevel%
 
 echo.

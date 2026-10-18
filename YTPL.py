@@ -1,7 +1,9 @@
 import yt_dlp
 import re
 import os
+import sys
 import math
+import argparse
 import subprocess
 import imageio_ffmpeg
 import requests
@@ -15,6 +17,16 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Режимы поиска точек реза.
+#   MODE_SILENCE — анализ пауз в аудио. Режим по умолчанию: таймкоды авторов на
+#                  миксах часто размечают не треки, а блоки по 15-20 минут, и
+#                  нарезка по ним склеивает несколько треков в один файл.
+#   MODE_META    — главы/описание видео. Включается только принудительно.
+#   MODE_MANUAL  — таймкоды, заданные пользователем.
+MODE_SILENCE = 'silence'
+MODE_META = 'meta'
+MODE_MANUAL = 'manual'
 
 def parse_time(time_str):
     """
@@ -97,6 +109,35 @@ def extract_timestamps(text):
             continue
 
     return sorted(set(timestamps))
+
+def timestamps_from_metadata(url, description, chapters):
+    """
+    Таймкоды из метаданных видео (используются только в режиме MODE_META).
+    Порядок источников:
+      1) структурные главы YouTube (info['chapters']) — самый надёжный;
+      2) регэкспы по описанию;
+      3) скрапинг HTML-страницы (слабый фолбэк).
+
+    Returns:
+        (список таймкодов в секундах, название источника).
+    """
+    if chapters:
+        # Границы треков — это старты глав (стартовую главу с 0 пропускаем).
+        timestamps = sorted({round(float(c['start_time']), 3) for c in chapters
+                             if c.get('start_time') and float(c['start_time']) > 0})
+        if timestamps:
+            return timestamps, f'главы YouTube ({len(chapters)} шт.)'
+
+    timestamps = extract_timestamps(description)
+    if timestamps:
+        return timestamps, 'описание видео'
+
+    timestamps = extract_timestamps(get_full_page_text(url))
+    if timestamps:
+        return timestamps, 'HTML-страница видео'
+
+    return [], 'не найдено'
+
 
 def _run_silencedetect(audio_path, noise_tol, min_silence_dur):
     """
@@ -234,9 +275,20 @@ def detect_silence_timestamps(audio_path, duration, noise_tol='-30dB',
         t -= step
     levels.append(floor)
 
-    cuts = _segment_recursive(candidates, 0.0, float(duration), 0, levels,
-                              max_segment_len, hard_split_len=max_segment_len)
-    cuts = sorted(c for c in cuts if 0 < c < duration)
+    # Первый проход на стартовом пороге делаем всегда, независимо от длины
+    # участка: явная пауза между треками — это граница треков и в коротком
+    # видео (иначе альбом короче max_segment_len не резался бы вовсе).
+    base = sorted(mid for (mid, dur) in candidates if dur >= levels[0])
+    cuts = list(base)
+
+    # Понижение порога и жёсткий рез — только для участков, которые остались
+    # слишком длинными после первого прохода.
+    bounds = [0.0] + base + [float(duration)]
+    for i in range(len(bounds) - 1):
+        cuts += _segment_recursive(candidates, bounds[i], bounds[i + 1], 1, levels,
+                                   max_segment_len, hard_split_len=max_segment_len)
+
+    cuts = sorted({c for c in cuts if 0 < c < duration})
     cuts = _enforce_min_segment(cuts, duration, min_segment)
 
     logger.info(f"silencedetect: пауз-кандидатов — {len(candidates)}, "
@@ -354,9 +406,16 @@ def split_audio(audio_path, timestamps, duration, base_name='видео', output
 
     return created_files
 
-def process_youtube_video(url, manual_timestamps=None):
+def process_youtube_video(url, manual_timestamps=None, mode=MODE_SILENCE,
+                          silence_opts=None):
     """
     Main function to process YouTube video.
+
+    Parameters:
+        manual_timestamps — строка вида '145,325'; если задана, режим всегда MODE_MANUAL.
+        mode              — MODE_SILENCE (по умолчанию), MODE_META или MODE_MANUAL.
+        silence_opts      — dict с параметрами detect_silence_timestamps.
+
     Returns list of created segment paths.
     """
     temp_dir_path = None  # Для хранения пути к временной директории
@@ -368,35 +427,35 @@ def process_youtube_video(url, manual_timestamps=None):
         print(f"Video title: {title}")
         print(f"Video duration: {duration}s")
 
-        # Приоритет источников таймкодов:
-        #   1) заданные вручную;
-        #   2) структурные главы YouTube (info['chapters']) — самый надёжный источник;
-        #   3) регэкспы по описанию;
-        #   4) скрапинг HTML-страницы (слабый фолбэк);
-        #   5) детект пауз (ниже, если ничего не нашли).
+        # Источник точек реза задаётся режимом, а не наличием таймкодов у автора:
+        # главы и описание в приоритет НЕ попадают, потому что на миксах они
+        # обычно размечают блоки из нескольких треков. См. MODE_* выше.
         if manual_timestamps:
-            timestamps = [int(t) for t in manual_timestamps.split(',') if t.strip().isdigit()]
-            print(f"Using manual timestamps: {timestamps}")
-        elif chapters:
-            # Границы треков — это старты глав (стартовую главу с 0 пропускаем).
-            timestamps = sorted({round(float(c['start_time']), 3) for c in chapters
-                                 if c.get('start_time') and float(c['start_time']) > 0})
-            print(f"Using {len(chapters)} chapters from metadata: {timestamps}")
-        else:
-            timestamps = extract_timestamps(description)
+            mode = MODE_MANUAL
+
+        if mode == MODE_MANUAL:
+            timestamps = [int(t) for t in str(manual_timestamps).split(',')
+                          if t.strip().isdigit()]
+            logger.info(f"Режим: ручные таймкоды — {timestamps}")
+        elif mode == MODE_META:
+            logger.info("Режим: таймкоды из метаданных (запрошен принудительно).")
+            timestamps, source = timestamps_from_metadata(url, description, chapters)
+            logger.info(f"Источник: {source}; точек разреза — {len(timestamps)}: {timestamps}")
             if not timestamps:
-                page_text = get_full_page_text(url)
-                timestamps = extract_timestamps(page_text)
-            print(f"Extracted timestamps: {timestamps}")
+                logger.warning("В метаданных таймкодов нет — перехожу на анализ пауз.")
+                timestamps = detect_silence_timestamps(audio_path, duration,
+                                                       **(silence_opts or {}))
+        else:
+            logger.info("Режим: анализ пауз в аудио (метаданные игнорируются).")
+            timestamps = detect_silence_timestamps(audio_path, duration,
+                                                   **(silence_opts or {}))
 
         if not timestamps:
-            logger.info("Метки времени не найдены. Запускаю анализ пауз (silence detection)...")
-            timestamps = detect_silence_timestamps(audio_path, duration)
-
-        if not timestamps:
-            cont = input("No timestamps found. Continue with download? (y/n): ").strip().lower()
-            if cont != 'y':
-                return []
+            logger.warning("Точек разреза не найдено — аудио останется одним файлом.")
+            if sys.stdin is not None and sys.stdin.isatty():
+                cont = input("Сохранить одним файлом? (y/n): ").strip().lower()
+                if cont not in ('', 'y', 'yes', 'д', 'да'):
+                    return []
 
         # Split audio
         base_name = re.sub(r'[^\w\-_\. ]', '_', title).replace(' ', '_')
@@ -427,7 +486,119 @@ def process_youtube_video(url, manual_timestamps=None):
             except Exception as cleanup_error:
                 logger.warning(f"Не удалось удалить временные файлы: {cleanup_error}")
 
+def build_parser():
+    """
+    Разбор аргументов командной строки. Без аргументов скрипт спросит всё сам.
+    """
+    p = argparse.ArgumentParser(
+        prog='YTPL',
+        description='Скачивает аудио с YouTube и нарезает его на отдельные треки. '
+                    'По умолчанию режет по паузам в аудио; главы и таймкоды из '
+                    'описания берутся только с флагом --from-description.',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument('url', nargs='?', help='ссылка на видео YouTube')
+    p.add_argument('-t', '--timestamps', metavar='СЕК',
+                   help="свои таймкоды в секундах через запятую, напр. '145,325'")
+    p.add_argument('-d', '--from-description', '--desc', '--chapters',
+                   dest='from_description', action='store_true',
+                   help='принудительно взять таймкоды из глав/описания видео '
+                        'вместо анализа пауз')
+    p.add_argument('--silence', dest='force_silence', action='store_true',
+                   help='явно выбрать анализ пауз (режим по умолчанию)')
+
+    g = p.add_argument_group('настройка анализа пауз')
+    g.add_argument('--noise', default='-30dB', metavar='dB',
+                   help='порог громкости, ниже которого звук считается тишиной; '
+                        'минус можно опустить: --noise 30dB или --noise=-30dB')
+    g.add_argument('--min-silence', type=float, default=1.5, metavar='СЕК',
+                   help='стартовый порог длины паузы')
+    g.add_argument('--floor', type=float, default=0.8, metavar='СЕК',
+                   help='минимальный порог длины паузы при понижении')
+    g.add_argument('--max-segment', type=float, default=300.0, metavar='СЕК',
+                   help='участок длиннее этого дорезается более низким порогом')
+    g.add_argument('--min-segment', type=float, default=15.0, metavar='СЕК',
+                   help='минимальная длина трека: короткие огрызки сливаются с соседом')
+    return p
+
+
+def prompt_mode():
+    """
+    Интерактивный выбор режима. Enter — анализ пауз (режим по умолчанию).
+    Returns (mode, manual_timestamps).
+    """
+    print()
+    print("Режим нарезки:")
+    print("  [Enter] — по паузам в аудио (по умолчанию: подходит для миксов и альбомов)")
+    print("  d       — по главам/таймкодам из описания видео")
+    print("  145,325 — свои таймкоды в секундах через запятую")
+    choice = input("Выбор: ").strip()
+    if not choice:
+        return MODE_SILENCE, None
+    if choice.lower() in ('d', 'в', 'desc', 'описание', 'главы'):
+        return MODE_META, None
+    return MODE_MANUAL, choice
+
+
+def resolve_mode(args, interactive=None):
+    """
+    Определяет режим нарезки по аргументам командной строки.
+
+    Приоритет: свои таймкоды -> принудительные метаданные -> режим по умолчанию.
+    Если ссылку передали аргументом и флагов нет, работаем молча в режиме по
+    умолчанию; без аргументов вообще — спрашиваем режим у пользователя.
+
+    Parameters:
+        interactive — переопределяет автоопределение интерактивного запуска
+                      (по умолчанию: подключён ли stdin к терминалу).
+
+    Returns:
+        (mode, manual_timestamps).
+    """
+    if args.timestamps:
+        return MODE_MANUAL, args.timestamps
+    if args.from_description:
+        return MODE_META, None
+    if args.force_silence or args.url:
+        return MODE_SILENCE, None
+    if interactive is None:
+        interactive = sys.stdin is not None and sys.stdin.isatty()
+    if interactive:
+        return prompt_mode()
+    return MODE_SILENCE, None
+
+
+def normalize_noise(value):
+    """
+    Приводит порог громкости к виду, понятному ffmpeg ('-30dB').
+
+    argparse не принимает запись '--noise -30dB': значение с минуса читается
+    как очередной флаг. Поэтому допускаем и форму без минуса ('--noise 30dB'),
+    приводя её к отрицательному значению.
+    """
+    value = str(value).strip()
+    if not value:
+        return '-30dB'
+    if not value.startswith('-'):
+        value = '-' + value.lstrip('+')
+    return value
+
+
+def silence_opts_from_args(args):
+    """
+    Собирает параметры анализа пауз из аргументов командной строки.
+    """
+    return {
+        'noise_tol': normalize_noise(args.noise),
+        'min_silence_dur': args.min_silence,
+        'floor': args.floor,
+        'max_segment_len': args.max_segment,
+        'min_segment': args.min_segment,
+    }
+
+
 if __name__ == "__main__":
+    args = build_parser().parse_args()
+
     # Проверка наличия ffmpeg
     try:
         ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
@@ -438,13 +609,19 @@ if __name__ == "__main__":
         logger.error(f"FFmpeg не найден. Установите imageio-ffmpeg: pip install imageio-ffmpeg")
         exit(1)
 
-    url = input("Enter YouTube video URL: ").strip()
-    manual_input = input("Enter manual timestamps (comma-separated in seconds, e.g., '145,325'), or leave empty to extract from description: ").strip()
+    url = args.url or input("Ссылка на видео YouTube: ").strip()
+    if not url:
+        logger.error("Ссылка не указана.")
+        exit(1)
 
-    manual_timestamps = manual_input if manual_input else None
+    # Режим: флаги важнее всего, затем — интерактивный вопрос. Если ссылку
+    # передали аргументом и флагов нет, работаем молча в режиме по умолчанию.
+    mode, manual_timestamps = resolve_mode(args)
+    silence_opts = silence_opts_from_args(args)
 
     try:
-        process_youtube_video(url, manual_timestamps)
+        process_youtube_video(url, manual_timestamps, mode=mode,
+                              silence_opts=silence_opts)
     except KeyboardInterrupt:
         logger.info("\nОперация отменена пользователем")
     except Exception as e:
